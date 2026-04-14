@@ -1,0 +1,8 @@
+target/
+target*/
+
+.cargo-target*/
+.colmem/
+.fastembed_cache/
+.obsidian/
+.omx/

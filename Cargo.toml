@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/colmem-core",
+    "crates/colmem-cli",
+    "crates/colmem-mcp",
+    "crates/colmem-hosts",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["OpenAI Codex"]

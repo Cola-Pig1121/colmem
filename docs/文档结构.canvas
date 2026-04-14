@@ -1,0 +1,21 @@
+{
+	"nodes":[
+		{"id":"4a0dc6ab1f0d9a11","type":"group","x":-60,"y":-40,"width":1540,"height":860,"label":"Colmem Docs","color":"4"},
+		{"id":"a1f71db5302c4f20","type":"file","x":40,"y":40,"width":320,"height":220,"file":"docs/00-索引.md"},
+		{"id":"d934ac0f8de14d51","type":"file","x":420,"y":40,"width":320,"height":220,"file":"docs/01-快速开始.md"},
+		{"id":"b7ac53af3d1f8412","type":"file","x":800,"y":40,"width":320,"height":220,"file":"docs/02-开发规范/index.md"},
+		{"id":"fd0d2be4e47fb763","type":"file","x":1180,"y":40,"width":320,"height":220,"file":"docs/03-架构设计/index.md"},
+		{"id":"e3105f2f6f70c8aa","type":"file","x":800,"y":340,"width":320,"height":220,"file":"docs/04-开发笔记/index.md"},
+		{"id":"e71816d1dc616eb5","type":"file","x":40,"y":340,"width":320,"height":220,"file":"docs/IMPLEMENTATION_PLAN.md"},
+		{"id":"3baf9f0a4a1162ce","type":"file","x":420,"y":340,"width":320,"height":220,"file":"docs/ISSUES_TODO.md"},
+		{"id":"0dc84149f3aa2386","type":"text","x":1180,"y":340,"width":300,"height":220,"text":"# Overview\n\n- 00-索引 is the main entry\n- 快速开始 covers startup commands\n- 开发规范 keeps interfaces and naming stable\n- 架构设计 explains crates and folders\n- 开发笔记 stores dynamic lessons"}
+	],
+	"edges":[
+		{"id":"286c255dbd88ea31","fromNode":"a1f71db5302c4f20","fromSide":"right","toNode":"d934ac0f8de14d51","toSide":"left","toEnd":"arrow","label":"entry"},
+		{"id":"5c5fb1193951dd49","fromNode":"a1f71db5302c4f20","fromSide":"right","toNode":"b7ac53af3d1f8412","toSide":"left","toEnd":"arrow","label":"conventions"},
+		{"id":"054962df2b8f7af0","fromNode":"a1f71db5302c4f20","fromSide":"right","toNode":"fd0d2be4e47fb763","toSide":"left","toEnd":"arrow","label":"architecture"},
+		{"id":"c7634ad0ee246fe8","fromNode":"a1f71db5302c4f20","fromSide":"bottom","toNode":"e3105f2f6f70c8aa","toSide":"top","toEnd":"arrow","label":"notes"},
+		{"id":"dc1d4aee5517ab1a","fromNode":"d934ac0f8de14d51","fromSide":"bottom","toNode":"e71816d1dc616eb5","toSide":"top","toEnd":"arrow","label":"plan"},
+		{"id":"e36f8584b758c8a4","fromNode":"d934ac0f8de14d51","fromSide":"bottom","toNode":"3baf9f0a4a1162ce","toSide":"top","toEnd":"arrow","label":"issues"}
+	]
+}

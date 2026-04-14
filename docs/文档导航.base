@@ -1,0 +1,32 @@
+filters:
+  and:
+    - file.inFolder("docs")
+    - file.ext == "md"
+    - file.name != "README"
+formulas:
+  section: if(file.folder.contains("02-开发规范"), "开发规范", if(file.folder.contains("03-架构设计"), "架构设计", if(file.folder.contains("04-开发笔记"), "开发笔记", "总览")))
+  short_path: file.path.replace("docs/", "")
+properties:
+  title:
+    displayName: 标题
+  formula.section:
+    displayName: 分区
+  formula.short_path:
+    displayName: 路径
+  file.mtime:
+    displayName: 更新时间
+views:
+  - type: table
+    name: Docs Table
+    order:
+      - file.name
+      - title
+      - formula.section
+      - formula.short_path
+      - file.mtime
+  - type: cards
+    name: Docs Cards
+    order:
+      - file.name
+      - title
+      - formula.section
