@@ -15,7 +15,5 @@ pub fn embed_texts(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
         InitOptions::new(local_embedding_model()).with_show_download_progress(true),
     )
     .map_err(|err| err.to_string())?;
-    model
-        .embed(texts.to_vec(), None)
-        .map_err(|err| err.to_string())
+    model.embed(texts, None).map_err(|err| err.to_string())
 }

@@ -70,7 +70,7 @@ impl Fact {
             0 => 0,
             1 => 1,
             2 => 2,
-            len => ((len * 2) + 2) / 3,
+            len => (len * 2).div_ceil(3),
         };
 
         if overlap >= required_overlap {
@@ -639,7 +639,7 @@ impl InMemoryFactStore {
         for fact in &facts {
             let key = (fact.subject.clone(), fact.predicate.clone());
             *conflict_count_by_relation.entry(key.clone()).or_insert(0) += 1;
-            if fact.is_active_on(&reference_date) {
+            if fact.is_active_on(reference_date) {
                 let current = latest_active_by_relation
                     .entry(key)
                     .or_insert_with(|| fact.valid_from_or_min().to_string());
@@ -653,7 +653,7 @@ impl InMemoryFactStore {
             .into_iter()
             .map(|fact| {
                 let key = (fact.subject.clone(), fact.predicate.clone());
-                let active = fact.is_active_on(&reference_date);
+                let active = fact.is_active_on(reference_date);
                 let latest_active = latest_active_by_relation.get(&key);
                 let conflicting = conflict_count_by_relation.get(&key).copied().unwrap_or(0) > 1;
 

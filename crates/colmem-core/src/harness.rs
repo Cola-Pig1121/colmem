@@ -261,6 +261,7 @@ impl HarnessRuntimeEngine {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_disabled(
         disabled: &mut BTreeMap<String, String>,
         audit: &mut Vec<CapabilityDecisionAudit>,

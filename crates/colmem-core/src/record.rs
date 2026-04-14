@@ -11,8 +11,9 @@ pub enum RecordSourceType {
     ConversationExport,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ChunkSourceKind {
+    #[default]
     Implementation,
     Test,
     Documentation,
@@ -31,12 +32,6 @@ impl ChunkSourceKind {
             Self::Plan => "plan",
             Self::Generated => "generated",
         }
-    }
-}
-
-impl Default for ChunkSourceKind {
-    fn default() -> Self {
-        Self::Implementation
     }
 }
 

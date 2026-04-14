@@ -786,7 +786,6 @@ fn synthetic_index(project_id: &str, graph: &colmem_core::SpaceGraph, size: &str
         },
         records,
         chunks,
-        ..Default::default()
     }
 }
 
@@ -1144,7 +1143,7 @@ fn vector_index_for_chunks(chunks: &[Chunk], embedding: &str) -> Result<VectorIn
 fn semantic_embed_texts(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
     #[cfg(feature = "semantic-embeddings")]
     {
-        return colmem_core::semantic::embed_texts(texts);
+        colmem_core::semantic::embed_texts(texts)
     }
     #[cfg(not(feature = "semantic-embeddings"))]
     {
@@ -1343,7 +1342,6 @@ fn locomo_index_for_sample(
         vector,
         records,
         chunks,
-        ..Default::default()
     })
 }
 
@@ -1436,7 +1434,6 @@ fn locomo_restricted_dialog_index_for_sample(
         vector,
         records,
         chunks,
-        ..Default::default()
     })
 }
 

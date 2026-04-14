@@ -79,10 +79,10 @@ impl SpaceGraph {
                     None
                 };
 
-                if let Some(next_id) = next {
-                    if visited.insert(next_id.clone()) {
-                        frontier.push_back((next_id, depth + 1));
-                    }
+                if let Some(next_id) = next
+                    && visited.insert(next_id.clone())
+                {
+                    frontier.push_back((next_id, depth + 1));
                 }
             }
         }
