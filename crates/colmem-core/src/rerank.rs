@@ -3,6 +3,31 @@ use serde::{Deserialize, Serialize};
 use crate::model::TaskKind;
 
 #[derive(Clone, Debug)]
+pub struct RerankModelCandidate {
+    pub chunk_id: String,
+    pub source_path: String,
+    pub text: String,
+    pub current_score: u8,
+}
+
+#[derive(Clone, Debug)]
+pub struct RerankModelRequest {
+    pub query: String,
+    pub candidates: Vec<RerankModelCandidate>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RerankModelScore {
+    pub chunk_id: String,
+    pub score: f32,
+    pub reason: Option<String>,
+}
+
+pub trait ExternalRerankModel {
+    fn rerank(&self, request: &RerankModelRequest) -> Result<Vec<RerankModelScore>, String>;
+}
+
+#[derive(Clone, Debug)]
 pub struct RerankFactHint {
     pub summary: String,
     pub tokens: Vec<String>,

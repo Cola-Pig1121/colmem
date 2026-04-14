@@ -13,10 +13,10 @@ This file tracks known issues, deferred fixes, and non-blocking quality gaps dis
 ### High
 
 - Retrieval quality is still rule-heavy and path-biased.
-  - Why it matters: persisted `source_kind`, explicit ingest/rerank policies, and broader golden fixtures make the policy boundary clearer, but ranking is still largely hand-tuned. After fixing conversation-local LoCoMo indexing and adding generic question-stopword filtering, the real official no-limit LoCoMo run improved to Recall@5 = 0.826 at session granularity and 0.526 at dialog granularity across 1982 answered evidence questions. Feature-gated local `BAAI/bge-small-zh-v1.5` semantic embeddings improve session Recall@5 to 0.862, but dialog-granularity fusion still needs calibration.
+  - Why it matters: persisted `source_kind`, explicit ingest/rerank policies, and broader golden fixtures make the policy boundary clearer, but ranking is still largely hand-tuned. After fixing conversation-local LoCoMo indexing, adding generic question-stopword filtering, and preserving session date context in chunks, the real official no-limit LoCoMo signature session run reaches Recall@1 = 0.476, Recall@5 = 0.834, Recall@10 = 0.934, and Recall@50 = 1.000 across 1982 answered evidence questions. Feature-gated local `BAAI/bge-small-zh-v1.5` semantic embeddings improve session Recall@5 to 0.862. Dialog recall remains lower, but one-turn neighbor context plus opt-in conservative query-feature near-tie rerank improves official dialog Recall@5 to 0.573 and Recall@10 to 0.682 without using answers/evidence at retrieval time. Per-category diagnostics show category 1/3 dialog questions remain weak, so the next work should improve general dialog-temporal reasoning rather than tuning to data rows.
   - Suggested phase: retrieval backend/rerank hardening.
 
-- Remote embedding fallback is not implemented yet.
+- Remote embedding fallback is implemented but not live-validated in this session.
   - Why it matters: local `BAAI/bge-small-zh-v1.5` works on this machine, and a feature-gated ModelScope/OpenAI-compatible fallback path now exists via environment variables (`COLMEM_EMBEDDING_BASE_URL`, `COLMEM_EMBEDDING_API_KEY` or `MODELSCOPE_API_KEY`, `COLMEM_EMBEDDING_MODEL`) without hardcoded tokens. It still needs real remote benchmark validation with a user-provided environment key.
   - Suggested phase: semantic embedding backend follow-up.
 

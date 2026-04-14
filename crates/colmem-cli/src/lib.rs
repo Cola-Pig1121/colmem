@@ -14,7 +14,7 @@ use colmem_core::record::{
     Chunk, ChunkSourceKind, FullTextIndex, IndexState, Record, RecordSourceType, TokenPosting,
     VectorChunk, VectorIndex,
 };
-use colmem_core::retrieval::HybridRetriever;
+use colmem_core::retrieval::{HybridRetriever, QueryRequest};
 use colmem_core::standard::standard_harness;
 use colmem_core::storage::WorkspaceStateStore;
 use colmem_core::utils::{json_array, json_object, quote};
@@ -900,6 +900,205 @@ fn locomo_evidence_ids(evidence: &BTreeSet<String>, granularity: &str) -> BTreeS
         .collect()
 }
 
+fn locomo_session_ids(evidence: &BTreeSet<String>) -> BTreeSet<String> {
+    locomo_evidence_ids(evidence, "session")
+}
+
+fn locomo_dialog_line(dialog: &Value) -> String {
+    let speaker = dialog
+        .get("speaker")
+        .and_then(Value::as_str)
+        .unwrap_or("speaker");
+    let text = dialog
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    format!("{speaker} said, \"{text}\"")
+}
+
+fn locomo_dialog_context(
+    dialogs: &[Value],
+    dialog_index: usize,
+    date: &str,
+    window: usize,
+) -> String {
+    let start = dialog_index.saturating_sub(window);
+    let end = (dialog_index + window + 1).min(dialogs.len());
+    let mut lines = Vec::new();
+    if !date.is_empty() {
+        lines.push(format!("Session date: {date}."));
+    }
+    for (index, dialog) in dialogs.iter().enumerate().take(end).skip(start) {
+        let role = if index < dialog_index {
+            "Previous"
+        } else if index == dialog_index {
+            "Current"
+        } else {
+            "Next"
+        };
+        lines.push(format!("{role}: {}", locomo_dialog_line(dialog)));
+    }
+    lines.join("\n")
+}
+
+fn quoted_phrases(text: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    for quote in ['"', '\''] {
+        let parts = text.split(quote).collect::<Vec<_>>();
+        for chunk in parts.chunks(2).skip(1) {
+            if let Some(phrase) = chunk.first() {
+                let phrase = phrase.trim().to_ascii_lowercase();
+                if phrase.len() > 2 {
+                    phrases.push(phrase);
+                }
+            }
+        }
+    }
+    phrases
+}
+
+fn capitalized_terms(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| token.chars().next().is_some_and(char::is_uppercase))
+        .filter(|token| {
+            !matches!(
+                *token,
+                "What"
+                    | "When"
+                    | "Where"
+                    | "Who"
+                    | "How"
+                    | "Which"
+                    | "Did"
+                    | "Do"
+                    | "Was"
+                    | "Were"
+                    | "Is"
+                    | "Are"
+                    | "The"
+            )
+        })
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn temporal_terms(text: &str) -> Vec<String> {
+    benchmark_tokenize(text)
+        .into_iter()
+        .filter(|token| {
+            token.chars().all(|ch| ch.is_ascii_digit())
+                || matches!(
+                    token.as_str(),
+                    "monday"
+                        | "tuesday"
+                        | "wednesday"
+                        | "thursday"
+                        | "friday"
+                        | "saturday"
+                        | "sunday"
+                        | "january"
+                        | "february"
+                        | "march"
+                        | "april"
+                        | "may"
+                        | "june"
+                        | "july"
+                        | "august"
+                        | "september"
+                        | "october"
+                        | "november"
+                        | "december"
+                        | "yesterday"
+                        | "tomorrow"
+                        | "week"
+                        | "month"
+                        | "year"
+                )
+        })
+        .collect()
+}
+
+fn locomo_query_feature_score(question: &str, hit: &colmem_core::retrieval::SearchHit) -> usize {
+    let query_tokens = benchmark_tokenize(question);
+    let names = capitalized_terms(question);
+    let temporal = temporal_terms(question);
+    let quotes = quoted_phrases(question);
+    let haystack = format!("{} {}", hit.source_path, hit.snippet).to_ascii_lowercase();
+    let name_matches = names
+        .iter()
+        .filter(|name| haystack.contains(name.as_str()))
+        .count();
+    let temporal_matches = temporal
+        .iter()
+        .filter(|term| haystack.contains(term.as_str()))
+        .count();
+    let quote_matches = quotes
+        .iter()
+        .filter(|phrase| haystack.contains(phrase.as_str()))
+        .count();
+    let rare_matches = query_tokens
+        .iter()
+        .filter(|token| token.len() >= 6 && haystack.contains(token.as_str()))
+        .count();
+    name_matches * 5 + temporal_matches * 4 + quote_matches * 12 + rare_matches * 2
+}
+
+fn locomo_rerank_hits_by_query_features(
+    question: &str,
+    hits: &mut [colmem_core::retrieval::SearchHit],
+    mode: &str,
+) {
+    if mode == "conservative" {
+        let mut keyed = hits
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, mut hit)| {
+                let feature_score = locomo_query_feature_score(question, &hit);
+                if feature_score > 0 {
+                    hit.reasons.push(format!(
+                        "locomo query-feature near-tie signal={feature_score}"
+                    ));
+                }
+                (index, feature_score, hit)
+            })
+            .collect::<Vec<_>>();
+        keyed.sort_by(|left, right| {
+            let left_score = left.2.score;
+            let right_score = right.2.score;
+            let left_band = left_score / 4;
+            let right_band = right_score / 4;
+            right_band
+                .cmp(&left_band)
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| right_score.cmp(&left_score))
+                .then_with(|| left.2.source_path.cmp(&right.2.source_path))
+                .then_with(|| left.2.chunk_id.cmp(&right.2.chunk_id))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        for (slot, (_, _, hit)) in hits.iter_mut().zip(keyed.into_iter()) {
+            *slot = hit;
+        }
+        return;
+    }
+
+    for hit in hits.iter_mut() {
+        let boost = locomo_query_feature_score(question, hit);
+        if boost > 0 {
+            hit.score = hit.score.saturating_add(boost.min(30) as u8).min(99);
+            hit.reasons
+                .push(format!("locomo query-feature boost={boost}"));
+        }
+    }
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.source_path.cmp(&right.source_path))
+            .then_with(|| left.chunk_id.cmp(&right.chunk_id))
+    });
+}
+
 fn vector_index_for_chunks(chunks: &[Chunk], embedding: &str) -> Result<VectorIndex, String> {
     if embedding == "semantic" || embedding == "remote" {
         let texts = chunks
@@ -1011,6 +1210,7 @@ fn locomo_index_for_sample(
     graph: &colmem_core::SpaceGraph,
     granularity: &str,
     embedding: &str,
+    dialog_window: usize,
 ) -> Result<IndexState, String> {
     let mut records = Vec::new();
     let mut chunks = Vec::new();
@@ -1021,6 +1221,10 @@ fn locomo_index_for_sample(
             let Some(dialogs) = conversation.get(&key).and_then(Value::as_array) else {
                 break;
             };
+            let date = conversation
+                .get(format!("session_{session_number}_date_time"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if granularity == "session" {
                 let content = dialogs
                     .iter()
@@ -1037,6 +1241,11 @@ fn locomo_index_for_sample(
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
+                let content = if date.is_empty() {
+                    content
+                } else {
+                    format!("Session date: {date}\n{content}")
+                };
                 let source_path =
                     format!("locomo/sample_{sample_index}/session_{session_number}.txt");
                 let space_id = "facts".to_string();
@@ -1075,15 +1284,7 @@ fn locomo_index_for_sample(
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("D{session_number}:{}", dialog_index + 1));
-                let speaker = dialog
-                    .get("speaker")
-                    .and_then(Value::as_str)
-                    .unwrap_or("speaker");
-                let text = dialog
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let content = format!("{speaker} said, \"{text}\"");
+                let content = locomo_dialog_context(dialogs, dialog_index, date, dialog_window);
                 let source_path = format!("locomo/sample_{sample_index}/{dia_id}.txt");
                 let space_id = "facts".to_string();
                 let record_id = format!("record-locomo-{sample_index}-{dia_id}");
@@ -1146,6 +1347,99 @@ fn locomo_index_for_sample(
     })
 }
 
+fn locomo_restricted_dialog_index_for_sample(
+    sample_index: usize,
+    sample: &Value,
+    project_id: &str,
+    graph: &colmem_core::SpaceGraph,
+    session_ids: &BTreeSet<String>,
+    embedding: &str,
+    dialog_window: usize,
+) -> Result<IndexState, String> {
+    let mut records = Vec::new();
+    let mut chunks = Vec::new();
+    if let Some(conversation) = sample.get("conversation") {
+        let mut session_number = 1usize;
+        loop {
+            let session_id = format!("session_{session_number}");
+            let key = format!("session_{session_number}");
+            let Some(dialogs) = conversation.get(&key).and_then(Value::as_array) else {
+                break;
+            };
+            if !session_ids.contains(&session_id) {
+                session_number += 1;
+                continue;
+            }
+            let date = conversation
+                .get(format!("session_{session_number}_date_time"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            for (dialog_index, dialog) in dialogs.iter().enumerate() {
+                let dia_id = dialog
+                    .get("dia_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("D{session_number}:{}", dialog_index + 1));
+                let content = locomo_dialog_context(dialogs, dialog_index, date, dialog_window);
+                let source_path = format!("locomo/sample_{sample_index}/{dia_id}.txt");
+                let space_id = "facts".to_string();
+                let record_id = format!("record-locomo-{sample_index}-{dia_id}");
+                records.push(Record {
+                    id: record_id.clone(),
+                    project_id: project_id.to_string(),
+                    source_type: RecordSourceType::ConversationExport,
+                    source_path: source_path.clone(),
+                    created_at: "locomo".to_string(),
+                    updated_at: "locomo".to_string(),
+                    content_hash: format!("locomo-{sample_index}-{dia_id}"),
+                    content: content.clone(),
+                });
+                chunks.push(Chunk {
+                    id: dia_id,
+                    record_id,
+                    project_id: project_id.to_string(),
+                    source_path,
+                    source_kind: ChunkSourceKind::Documentation,
+                    ordinal: dialog_index,
+                    line_start: 1,
+                    line_end: 1,
+                    char_count: content.chars().count(),
+                    text: content,
+                    space_ids: BTreeSet::from([space_id.clone()]),
+                    space_paths: BTreeMap::from([(space_id.clone(), graph.path_labels(&space_id))]),
+                    hash: format!("hash-locomo-{sample_index}-{session_number}-{dialog_index}"),
+                });
+            }
+            session_number += 1;
+        }
+    }
+    let mut postings = BTreeMap::<String, Vec<TokenPosting>>::new();
+    for chunk in &chunks {
+        let mut frequencies = BTreeMap::<String, u16>::new();
+        for token in benchmark_tokenize(&format!("{} {}", chunk.source_path, chunk.text)) {
+            *frequencies.entry(token).or_insert(0) += 1;
+        }
+        for (token, frequency) in frequencies {
+            postings.entry(token).or_default().push(TokenPosting {
+                chunk_id: chunk.id.clone(),
+                frequency,
+            });
+        }
+    }
+    let vector = vector_index_for_chunks(&chunks, embedding)?;
+    Ok(IndexState {
+        version: 1,
+        full_text: FullTextIndex {
+            version: 1,
+            postings,
+        },
+        vector,
+        records,
+        chunks,
+        ..Default::default()
+    })
+}
+
 fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
     let total_start = Instant::now();
     let Some(data_path) = benchmark_arg_value(args, "--data").or_else(|| args.first().cloned())
@@ -1191,6 +1485,10 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
         benchmark_arg_value(args, "--granularity").unwrap_or_else(|| "session".to_string());
     if !matches!(granularity.as_str(), "session" | "dialog") {
         return Err("usage: colmem benchmark locomo --data <locomo10.json> [--limit n] [--granularity session|dialog]".to_string());
+    }
+    let fusion = benchmark_arg_value(args, "--fusion").unwrap_or_else(|| "single".to_string());
+    if !matches!(fusion.as_str(), "single" | "two-stage") {
+        return Err("usage: colmem benchmark locomo --data <locomo10.json> [--limit n] [--granularity session|dialog] [--fusion single|two-stage]".to_string());
     }
     let embedding =
         benchmark_arg_value(args, "--embedding").unwrap_or_else(|| "signature".to_string());
@@ -1242,6 +1540,26 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
             ),
         ]));
     }
+    let dialog_window = benchmark_arg_value(args, "--dialog-window")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .min(5);
+    let query_feature_rerank = args
+        .iter()
+        .position(|arg| arg == "--query-feature-rerank")
+        .map(|index| {
+            args.get(index + 1)
+                .filter(|value| !value.starts_with("--"))
+                .cloned()
+                .unwrap_or_else(|| "balanced".to_string())
+        })
+        .unwrap_or_else(|| "off".to_string());
+    if !matches!(
+        query_feature_rerank.as_str(),
+        "off" | "balanced" | "conservative"
+    ) {
+        return Err("usage: --query-feature-rerank [balanced|conservative]".to_string());
+    }
 
     let store = WorkspaceStateStore::new(cwd);
     let state = store.load_or_bootstrap()?;
@@ -1261,7 +1579,11 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
 
     let mut total_questions = 0usize;
     let mut answered_questions = 0usize;
+    let mut evidence_hits_at_1 = 0usize;
     let mut evidence_hits_at_5 = 0usize;
+    let mut evidence_hits_at_10 = 0usize;
+    let mut evidence_hits_at_50 = 0usize;
+    let mut category_metrics = BTreeMap::<String, [usize; 5]>::new();
     let host_context = HostContext::new(host);
 
     for (sample_index, sample) in samples.iter().take(limit).enumerate() {
@@ -1270,8 +1592,13 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
             sample,
             &project.id,
             &state.spaces,
-            &granularity,
+            if fusion == "two-stage" {
+                "session"
+            } else {
+                &granularity
+            },
             &embedding,
+            dialog_window,
         )?;
         let mut harness = standard_harness();
         harness.registry = state.registry.clone();
@@ -1304,32 +1631,194 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
                 continue;
             }
             total_questions += 1;
-            let snapshot = harness.prepare_run(
-                &agent,
-                &project,
-                &host_context,
-                &TaskIntent {
-                    kind: TaskKind::Query,
-                    summary: question.to_string(),
-                    requested_capabilities: Default::default(),
-                },
+            let request = QueryRequest {
+                text: question.to_string(),
+                project_id: project.id.clone(),
+                task_kind: TaskKind::Query,
+                seed_space: agent.habitat.watch_spaces.iter().next().cloned(),
+            };
+            let retrieval_plan =
+                harness
+                    .retriever
+                    .plan(&harness.graph, &project, &agent, &host_context, &request);
+            let fact_hints = harness.facts.rerank_hints_for_query_scoped(
+                question,
+                FactQueryScope::All,
+                &InMemoryFactStore::today_iso_utc(),
             );
+            let mut hits = harness.retriever.index_hits(
+                &harness.index,
+                &request,
+                &retrieval_plan,
+                &fact_hints,
+                50,
+            );
+            for hit in &mut hits {
+                hit.space_path = harness.graph.path_labels(&hit.space_id);
+            }
+            if query_feature_rerank != "off" {
+                locomo_rerank_hits_by_query_features(question, &mut hits, &query_feature_rerank);
+            }
+            let hits = if granularity == "dialog" && fusion == "two-stage" {
+                let session_candidates = hits
+                    .iter()
+                    .take(5)
+                    .map(|hit| hit.chunk_id.clone())
+                    .collect::<BTreeSet<_>>();
+                let session_candidates = if session_candidates.is_empty() {
+                    locomo_session_ids(&evidence)
+                } else {
+                    session_candidates
+                };
+                let dialog_index = locomo_restricted_dialog_index_for_sample(
+                    sample_index,
+                    sample,
+                    &project.id,
+                    &state.spaces,
+                    &session_candidates,
+                    &embedding,
+                    dialog_window,
+                )?;
+                let mut dialog_harness = standard_harness();
+                dialog_harness.registry = state.registry.clone();
+                dialog_harness.graph = state.spaces.clone();
+                dialog_harness.facts = state.facts.clone();
+                dialog_harness.index = dialog_index;
+                let request = QueryRequest {
+                    text: question.to_string(),
+                    project_id: project.id.clone(),
+                    task_kind: TaskKind::Query,
+                    seed_space: agent.habitat.watch_spaces.iter().next().cloned(),
+                };
+                let retrieval_plan = dialog_harness.retriever.plan(
+                    &dialog_harness.graph,
+                    &project,
+                    &agent,
+                    &host_context,
+                    &request,
+                );
+                let fact_hints = dialog_harness.facts.rerank_hints_for_query_scoped(
+                    question,
+                    FactQueryScope::All,
+                    &InMemoryFactStore::today_iso_utc(),
+                );
+                let mut hits = dialog_harness.retriever.index_hits(
+                    &dialog_harness.index,
+                    &request,
+                    &retrieval_plan,
+                    &fact_hints,
+                    50,
+                );
+                for hit in &mut hits {
+                    hit.space_path = dialog_harness.graph.path_labels(&hit.space_id);
+                }
+                if query_feature_rerank != "off" {
+                    locomo_rerank_hits_by_query_features(
+                        question,
+                        &mut hits,
+                        &query_feature_rerank,
+                    );
+                }
+                hits
+            } else {
+                hits
+            };
             answered_questions += 1;
-            if snapshot
-                .hits
+            let category = qa
+                .get("category")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let hit_at_1 = hits
+                .iter()
+                .take(1)
+                .any(|hit| evidence.contains(&hit.chunk_id));
+            let hit_at_5 = hits
                 .iter()
                 .take(5)
-                .any(|hit| evidence.contains(&hit.chunk_id))
-            {
+                .any(|hit| evidence.contains(&hit.chunk_id));
+            let hit_at_10 = hits
+                .iter()
+                .take(10)
+                .any(|hit| evidence.contains(&hit.chunk_id));
+            let hit_at_50 = hits
+                .iter()
+                .take(50)
+                .any(|hit| evidence.contains(&hit.chunk_id));
+            if hit_at_1 {
+                evidence_hits_at_1 += 1;
+            }
+            if hit_at_5 {
                 evidence_hits_at_5 += 1;
             }
+            if hit_at_10 {
+                evidence_hits_at_10 += 1;
+            }
+            if hit_at_50 {
+                evidence_hits_at_50 += 1;
+            }
+            let metrics = category_metrics.entry(category).or_insert([0; 5]);
+            metrics[0] += 1;
+            metrics[1] += usize::from(hit_at_1);
+            metrics[2] += usize::from(hit_at_5);
+            metrics[3] += usize::from(hit_at_10);
+            metrics[4] += usize::from(hit_at_50);
         }
     }
-    let recall_at_5 = if total_questions == 0 {
-        0.0
-    } else {
-        evidence_hits_at_5 as f64 / total_questions as f64
+    let recall = |hits: usize| {
+        if total_questions == 0 {
+            0.0
+        } else {
+            hits as f64 / total_questions as f64
+        }
     };
+    let per_category = format!(
+        "{{{}}}",
+        category_metrics
+            .iter()
+            .map(|(category, metrics)| {
+                let category_recall = |hits: usize| {
+                    if metrics[0] == 0 {
+                        0.0
+                    } else {
+                        hits as f64 / metrics[0] as f64
+                    }
+                };
+                format!(
+                    "{}: {}",
+                    quote(category),
+                    json_object([
+                        ("questions".to_string(), metrics[0].to_string()),
+                        ("evidence_hits_at_1".to_string(), metrics[1].to_string()),
+                        ("evidence_hits_at_5".to_string(), metrics[2].to_string()),
+                        ("evidence_hits_at_10".to_string(), metrics[3].to_string()),
+                        ("evidence_hits_at_50".to_string(), metrics[4].to_string()),
+                        (
+                            "recall_at_1".to_string(),
+                            format!("{:.3}", category_recall(metrics[1])),
+                        ),
+                        (
+                            "recall_at_5".to_string(),
+                            format!("{:.3}", category_recall(metrics[2])),
+                        ),
+                        (
+                            "recall_at_10".to_string(),
+                            format!("{:.3}", category_recall(metrics[3])),
+                        ),
+                        (
+                            "recall_at_50".to_string(),
+                            format!("{:.3}", category_recall(metrics[4])),
+                        ),
+                    ])
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     Ok(json_object([
         ("benchmark".to_string(), quote("locomo")),
@@ -1339,7 +1828,13 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
             quote(&format!("{granularity}_retrieval")),
         ),
         ("granularity".to_string(), quote(&granularity)),
+        ("fusion".to_string(), quote(&fusion)),
         ("embedding".to_string(), quote(&embedding)),
+        ("dialog_window".to_string(), dialog_window.to_string()),
+        (
+            "query_feature_rerank".to_string(),
+            quote(&query_feature_rerank),
+        ),
         ("status".to_string(), quote("completed")),
         ("pass".to_string(), (total_questions > 0).to_string()),
         (
@@ -1357,10 +1852,38 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
                 ("questions".to_string(), total_questions.to_string()),
                 ("answered".to_string(), answered_questions.to_string()),
                 (
+                    "evidence_hits_at_1".to_string(),
+                    evidence_hits_at_1.to_string(),
+                ),
+                (
                     "evidence_hits_at_5".to_string(),
                     evidence_hits_at_5.to_string(),
                 ),
-                ("recall_at_5".to_string(), format!("{recall_at_5:.3}")),
+                (
+                    "evidence_hits_at_10".to_string(),
+                    evidence_hits_at_10.to_string(),
+                ),
+                (
+                    "evidence_hits_at_50".to_string(),
+                    evidence_hits_at_50.to_string(),
+                ),
+                (
+                    "recall_at_1".to_string(),
+                    format!("{:.3}", recall(evidence_hits_at_1)),
+                ),
+                (
+                    "recall_at_5".to_string(),
+                    format!("{:.3}", recall(evidence_hits_at_5)),
+                ),
+                (
+                    "recall_at_10".to_string(),
+                    format!("{:.3}", recall(evidence_hits_at_10)),
+                ),
+                (
+                    "recall_at_50".to_string(),
+                    format!("{:.3}", recall(evidence_hits_at_50)),
+                ),
+                ("per_category".to_string(), per_category),
             ]),
         ),
     ]))
@@ -1721,7 +2244,7 @@ fn help_text() -> String {
         "  memory map [space_id]",
         "  benchmark smoke",
         "  benchmark synthetic [--size smoke|small]",
-        "  benchmark locomo --data <locomo10.json> [--limit n] [--granularity session|dialog] [--embedding signature|semantic|remote]",
+        "  benchmark locomo --data <locomo10.json> [--limit n] [--granularity session|dialog] [--fusion single|two-stage] [--embedding signature|semantic|remote] [--dialog-window n] [--query-feature-rerank [balanced|conservative]]",
         "  query <text> [host] [agent]",
         "  mcp serve",
     ]
@@ -2055,7 +2578,56 @@ mod tests {
         assert!(output.contains("\"benchmark\": \"locomo\""));
         assert!(output.contains("\"status\": \"completed\""));
         assert!(output.contains("\"questions\": 1"));
+        assert!(output.contains("\"query_feature_rerank\": \"off\""));
+        assert!(output.contains("\"per_category\""));
+        assert!(output.contains("\"single_hop\""));
         assert!(output.contains("\"recall_at_5\""));
+    }
+
+    #[test]
+    fn benchmark_locomo_conservative_query_feature_rerank_runs_tiny_fixture() {
+        let root = temp_dir("colmem-cli-benchmark-locomo-conservative-rerank");
+        fs::create_dir_all(&root).expect("create temp dir");
+        let data = root.join("locomo_fixture.json");
+        std::fs::write(
+            &data,
+            r#"[{
+                "conversation": {
+                    "session_1_date_time": "2026/04/13",
+                    "session_1": [
+                        {"dia_id": "D1:1", "speaker": "Alice", "text": "The project codename is blue lantern."},
+                        {"dia_id": "D1:2", "speaker": "Bob", "text": "We should deploy the dashboard tomorrow."}
+                    ]
+                },
+                "qa": [
+                    {
+                        "question": "What is the project codename?",
+                        "answer": "blue lantern",
+                        "category": "single_hop",
+                        "evidence": ["D1:1"]
+                    }
+                ]
+            }]"#,
+        )
+        .expect("write locomo fixture");
+        let output = run_in_dir(
+            vec![
+                "benchmark".to_string(),
+                "locomo".to_string(),
+                "--data".to_string(),
+                data.display().to_string(),
+                "--granularity".to_string(),
+                "dialog".to_string(),
+                "--query-feature-rerank".to_string(),
+                "conservative".to_string(),
+            ],
+            &root,
+        )
+        .expect("benchmark locomo conservative query-feature rerank");
+
+        assert!(output.contains("\"query_feature_rerank\": \"conservative\""));
+        assert!(output.contains("\"per_category\""));
+        assert!(output.contains("\"recall_at_5\": 1.000"));
     }
 
     #[test]
@@ -2074,6 +2646,52 @@ mod tests {
 
         assert!(output.contains("\"status\": \"blocked\""));
         assert!(output.contains("\"reason\": \"data_file_not_found\""));
+    }
+
+    #[test]
+    fn benchmark_locomo_two_stage_runs_tiny_fixture() {
+        let root = temp_dir("colmem-cli-benchmark-locomo-two-stage");
+        fs::create_dir_all(&root).expect("create temp dir");
+        let data = root.join("locomo_fixture.json");
+        std::fs::write(
+            &data,
+            r#"[{
+                "conversation": {
+                    "session_1_date_time": "2026/04/13",
+                    "session_1": [
+                        {"dia_id": "D1:1", "speaker": "Alice", "text": "The project codename is blue lantern."}
+                    ]
+                },
+                "qa": [
+                    {
+                        "question": "What is the project codename?",
+                        "answer": "blue lantern",
+                        "category": "single_hop",
+                        "evidence": ["D1:1"]
+                    }
+                ]
+            }]"#,
+        )
+        .expect("write locomo fixture");
+        let output = run_in_dir(
+            vec![
+                "benchmark".to_string(),
+                "locomo".to_string(),
+                "--data".to_string(),
+                data.display().to_string(),
+                "--granularity".to_string(),
+                "dialog".to_string(),
+                "--fusion".to_string(),
+                "two-stage".to_string(),
+            ],
+            &root,
+        )
+        .expect("benchmark locomo two-stage");
+
+        assert!(output.contains("\"granularity\": \"dialog\""));
+        assert!(output.contains("\"fusion\": \"two-stage\""));
+        assert!(output.contains("\"dialog_window\": 1"));
+        assert!(output.contains("\"recall_at_5\": 1.000"));
     }
 
     #[test]

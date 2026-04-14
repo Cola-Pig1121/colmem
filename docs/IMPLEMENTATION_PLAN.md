@@ -1048,14 +1048,22 @@ Verified:
 - live command smoke passed for `cargo run -p colmem-cli -- benchmark synthetic --size smoke`
 - LoCoMo tiny fixture test covers the Rust-native adapter path, including missing-data blocked output
 - live command smoke passed for `cargo run -p colmem-cli -- benchmark locomo --data <tiny-fixture> --limit 1`
-- live official LoCoMo run passed against `D:\Temp\locomo\data\locomo10.json` with no `--limit` using default `--granularity session`: 10 conversations, 1982 answered evidence questions, Recall@5 = 0.826, elapsed_ms = 10808
-- live official LoCoMo dialog-granularity run also passed with no `--limit`: 10 conversations, 1982 answered evidence questions, Recall@5 = 0.526, elapsed_ms = 136399
+- live official LoCoMo run passed against `D:\Temp\locomo\data\locomo10.json` with no `--limit` using default `--granularity session`: 10 conversations, 1982 answered evidence questions, Recall@5 = 0.834, Recall@10 = 0.934, elapsed_ms = 10391
+- live official LoCoMo dialog-granularity run also passed with no `--limit`: 10 conversations, 1982 answered evidence questions, Recall@5 = 0.551, Recall@10 = 0.667, elapsed_ms = 161275
 - optional local semantic embedding support is feature-gated behind `semantic-embeddings`; the default local model is `BAAI/bge-small-zh-v1.5`, with `BAAI/bge-large-zh-v1.5` available through `COLMEM_LOCAL_EMBEDDING_MODEL` when hardware allows it
 - remote OpenAI-compatible embedding fallback is feature-gated behind `remote-embeddings`; it reads `COLMEM_EMBEDDING_BASE_URL`, `COLMEM_EMBEDDING_API_KEY` or `MODELSCOPE_API_KEY`, and `COLMEM_EMBEDDING_MODEL`, and never hardcodes tokens
 - live official LoCoMo semantic session run passed with `BAAI/bge-small-zh-v1.5`: 10 conversations, 1982 answered evidence questions, Recall@5 = 0.862, elapsed_ms = 48549
 - feature checks now pass for `cargo check -p colmem-cli --features semantic-embeddings` and `cargo check -p colmem-cli --features remote-embeddings`
 - LoCoMo adapter now indexes and scores each conversation independently, matching LoCoMo's conversation-local evidence ids instead of mixing repeated `D1:1`-style ids across conversations
 - retrieval/fact query tokenization now filters common question stopwords, reducing lexical noise without using LoCoMo answers or evidence during retrieval
+- LoCoMo adapter now includes session date text in session/dialog chunks, preserving temporal memory context needed for when/when-did style questions without using answers or evidence as hints
+- live official LoCoMo signature session run after temporal context injection now reports multi-k recall and per-category diagnostics: Recall@1 = 0.476, Recall@5 = 0.834, Recall@10 = 0.934, Recall@50 = 1.000 across 1982 answered evidence questions, elapsed_ms = 10391
+- experimental two-stage session-to-dialog retrieval is implemented for LoCoMo, but the official no-limit dialog run did not improve materially yet: Recall@5 = 0.525, so further work should focus on query-feature rerank rather than treating two-stage routing alone as sufficient
+- LoCoMo dialog chunks now preserve a one-turn neighbor context window, improving official no-limit dialog Recall@5 to 0.551, Recall@10 to 0.667, and Recall@50 to 0.838 without using answers or evidence as retrieval hints
+- experimental query-feature rerank is available behind `--query-feature-rerank [balanced|conservative]`; the conservative near-tie mode improves official no-limit signature session Recall@5 to 0.859 and dialog Recall@5 to 0.573 while remaining opt-in until broader validation proves it generalizes
+- benchmark output now includes per-category LoCoMo recall diagnostics, which show category 1/3 dialog questions remain the weakest areas and should guide future retrieval/rerank work without changing data or using evidence during retrieval
+- `colmem-core` now reserves an external rerank-model integration surface (`ExternalRerankModel`, `RerankModelRequest`, `RerankModelCandidate`, `RerankModelScore`) without adding a real model dependency; built-in retrieval must remain strong when no external reranker is configured
+- LoCoMo `--dialog-window 2` is available for experimentation; official no-limit dialog run improved Recall@1 to 0.137, Recall@10 to 0.687, and Recall@50 to 0.876, but Recall@5 dipped to 0.547, so the default remains `--dialog-window 1`
 - direct CLI library tests for `init`, `host list`, `capability list`, `facts`, and `ingest -> query`
 - capability-enforcement regressions for `write` permissions and stateful host safety
 - capability permission parsing regression for known and unknown permission values

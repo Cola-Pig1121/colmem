@@ -37,7 +37,10 @@ pub use record::{
     Chunk, FullTextIndex, IndexState, Record, RecordSourceType, TokenPosting, VectorChunk,
     VectorIndex,
 };
-pub use rerank::{LightweightReranker, RerankCandidate, RerankFactHint, RerankResult, SourceKind};
+pub use rerank::{
+    ExternalRerankModel, LightweightReranker, RerankCandidate, RerankFactHint,
+    RerankModelCandidate, RerankModelRequest, RerankModelScore, RerankResult, SourceKind,
+};
 pub use retrieval::{HybridRetriever, QueryRequest, RetrievalMode, RetrievalPlan, SearchHit};
 pub use space::{SpaceGraph, SpaceLink, SpaceLinkKind, SpaceNode};
 pub use storage::{EvolutionRecord, WorkspacePaths, WorkspaceState, WorkspaceStateStore};
