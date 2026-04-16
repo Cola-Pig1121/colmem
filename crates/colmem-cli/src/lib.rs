@@ -899,10 +899,6 @@ fn locomo_evidence_ids(evidence: &BTreeSet<String>, granularity: &str) -> BTreeS
         .collect()
 }
 
-fn locomo_session_ids(evidence: &BTreeSet<String>) -> BTreeSet<String> {
-    locomo_evidence_ids(evidence, "session")
-}
-
 fn locomo_dialog_line(dialog: &Value) -> String {
     let speaker = dialog
         .get("speaker")
@@ -1580,6 +1576,9 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
     let mut evidence_hits_at_5 = 0usize;
     let mut evidence_hits_at_10 = 0usize;
     let mut evidence_hits_at_50 = 0usize;
+    let mut top50_saturated_questions = 0usize;
+    let mut candidate_pool_min = usize::MAX;
+    let mut candidate_pool_max = 0usize;
     let mut category_metrics = BTreeMap::<String, [usize; 5]>::new();
     let host_context = HostContext::new(host);
 
@@ -1602,6 +1601,7 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
         harness.graph = state.spaces.clone();
         harness.facts = state.facts.clone();
         harness.index = index;
+        let initial_candidate_pool = harness.index.chunks.len();
         let Some(qa_pairs) = sample.get("qa").and_then(Value::as_array) else {
             continue;
         };
@@ -1656,17 +1656,12 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
             if query_feature_rerank != "off" {
                 locomo_rerank_hits_by_query_features(question, &mut hits, &query_feature_rerank);
             }
-            let hits = if granularity == "dialog" && fusion == "two-stage" {
+            let (hits, candidate_pool_size) = if granularity == "dialog" && fusion == "two-stage" {
                 let session_candidates = hits
                     .iter()
                     .take(5)
                     .map(|hit| hit.chunk_id.clone())
                     .collect::<BTreeSet<_>>();
-                let session_candidates = if session_candidates.is_empty() {
-                    locomo_session_ids(&evidence)
-                } else {
-                    session_candidates
-                };
                 let dialog_index = locomo_restricted_dialog_index_for_sample(
                     sample_index,
                     sample,
@@ -1716,11 +1711,16 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
                         &query_feature_rerank,
                     );
                 }
-                hits
+                (hits, dialog_harness.index.chunks.len())
             } else {
-                hits
+                (hits, initial_candidate_pool)
             };
             answered_questions += 1;
+            candidate_pool_min = candidate_pool_min.min(candidate_pool_size);
+            candidate_pool_max = candidate_pool_max.max(candidate_pool_size);
+            if candidate_pool_size <= 50 {
+                top50_saturated_questions += 1;
+            }
             let category = qa
                 .get("category")
                 .map(|value| {
@@ -1848,6 +1848,26 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
             json_object([
                 ("questions".to_string(), total_questions.to_string()),
                 ("answered".to_string(), answered_questions.to_string()),
+                (
+                    "candidate_pool_min".to_string(),
+                    if candidate_pool_min == usize::MAX {
+                        "0".to_string()
+                    } else {
+                        candidate_pool_min.to_string()
+                    },
+                ),
+                (
+                    "candidate_pool_max".to_string(),
+                    candidate_pool_max.to_string(),
+                ),
+                (
+                    "top50_saturated_questions".to_string(),
+                    top50_saturated_questions.to_string(),
+                ),
+                (
+                    "recall_at_50_saturated".to_string(),
+                    (top50_saturated_questions > 0).to_string(),
+                ),
                 (
                     "evidence_hits_at_1".to_string(),
                     evidence_hits_at_1.to_string(),
