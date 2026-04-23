@@ -10,11 +10,12 @@ use colmem_core::harness::TaskIntent;
 use colmem_core::host::HostContext;
 use colmem_core::ingest::build_project_index;
 use colmem_core::model::{HostId, TaskKind};
+use colmem_core::query_feature_score;
 use colmem_core::record::{
     Chunk, ChunkSourceKind, FullTextIndex, IndexState, Record, RecordSourceType, TokenPosting,
     VectorChunk, VectorIndex,
 };
-use colmem_core::retrieval::{HybridRetriever, QueryRequest};
+use colmem_core::retrieval::{HybridRetriever, QueryRequest, SearchHit};
 use colmem_core::standard::standard_harness;
 use colmem_core::storage::WorkspaceStateStore;
 use colmem_core::utils::{json_array, json_object, quote};
@@ -885,6 +886,12 @@ fn benchmark_arg_value(args: &[String], flag: &str) -> Option<String> {
         .map(|window| window[1].clone())
 }
 
+fn first_evidence_rank(hits: &[SearchHit], evidence: &BTreeSet<String>) -> Option<usize> {
+    hits.iter()
+        .position(|hit| evidence.contains(&hit.chunk_id))
+        .map(|index| index + 1)
+}
+
 fn locomo_evidence_ids(evidence: &BTreeSet<String>, granularity: &str) -> BTreeSet<String> {
     if granularity == "dialog" {
         return evidence.clone();
@@ -936,108 +943,6 @@ fn locomo_dialog_context(
     lines.join("\n")
 }
 
-fn quoted_phrases(text: &str) -> Vec<String> {
-    let mut phrases = Vec::new();
-    for quote in ['"', '\''] {
-        let parts = text.split(quote).collect::<Vec<_>>();
-        for chunk in parts.chunks(2).skip(1) {
-            if let Some(phrase) = chunk.first() {
-                let phrase = phrase.trim().to_ascii_lowercase();
-                if phrase.len() > 2 {
-                    phrases.push(phrase);
-                }
-            }
-        }
-    }
-    phrases
-}
-
-fn capitalized_terms(text: &str) -> Vec<String> {
-    text.split(|ch: char| !ch.is_alphanumeric())
-        .filter(|token| token.chars().next().is_some_and(char::is_uppercase))
-        .filter(|token| {
-            !matches!(
-                *token,
-                "What"
-                    | "When"
-                    | "Where"
-                    | "Who"
-                    | "How"
-                    | "Which"
-                    | "Did"
-                    | "Do"
-                    | "Was"
-                    | "Were"
-                    | "Is"
-                    | "Are"
-                    | "The"
-            )
-        })
-        .map(|token| token.to_ascii_lowercase())
-        .collect()
-}
-
-fn temporal_terms(text: &str) -> Vec<String> {
-    benchmark_tokenize(text)
-        .into_iter()
-        .filter(|token| {
-            token.chars().all(|ch| ch.is_ascii_digit())
-                || matches!(
-                    token.as_str(),
-                    "monday"
-                        | "tuesday"
-                        | "wednesday"
-                        | "thursday"
-                        | "friday"
-                        | "saturday"
-                        | "sunday"
-                        | "january"
-                        | "february"
-                        | "march"
-                        | "april"
-                        | "may"
-                        | "june"
-                        | "july"
-                        | "august"
-                        | "september"
-                        | "october"
-                        | "november"
-                        | "december"
-                        | "yesterday"
-                        | "tomorrow"
-                        | "week"
-                        | "month"
-                        | "year"
-                )
-        })
-        .collect()
-}
-
-fn locomo_query_feature_score(question: &str, hit: &colmem_core::retrieval::SearchHit) -> usize {
-    let query_tokens = benchmark_tokenize(question);
-    let names = capitalized_terms(question);
-    let temporal = temporal_terms(question);
-    let quotes = quoted_phrases(question);
-    let haystack = format!("{} {}", hit.source_path, hit.snippet).to_ascii_lowercase();
-    let name_matches = names
-        .iter()
-        .filter(|name| haystack.contains(name.as_str()))
-        .count();
-    let temporal_matches = temporal
-        .iter()
-        .filter(|term| haystack.contains(term.as_str()))
-        .count();
-    let quote_matches = quotes
-        .iter()
-        .filter(|phrase| haystack.contains(phrase.as_str()))
-        .count();
-    let rare_matches = query_tokens
-        .iter()
-        .filter(|token| token.len() >= 6 && haystack.contains(token.as_str()))
-        .count();
-    name_matches * 5 + temporal_matches * 4 + quote_matches * 12 + rare_matches * 2
-}
-
 fn locomo_rerank_hits_by_query_features(
     question: &str,
     hits: &mut [colmem_core::retrieval::SearchHit],
@@ -1049,11 +954,11 @@ fn locomo_rerank_hits_by_query_features(
             .cloned()
             .enumerate()
             .map(|(index, mut hit)| {
-                let feature_score = locomo_query_feature_score(question, &hit);
+                let feature_score =
+                    query_feature_score(question, &hit.source_path, &hit.snippet).weighted_total();
                 if feature_score > 0 {
-                    hit.reasons.push(format!(
-                        "locomo query-feature near-tie signal={feature_score}"
-                    ));
+                    hit.reasons
+                        .push(format!("query-feature near-tie signal={feature_score}"));
                 }
                 (index, feature_score, hit)
             })
@@ -1078,11 +983,10 @@ fn locomo_rerank_hits_by_query_features(
     }
 
     for hit in hits.iter_mut() {
-        let boost = locomo_query_feature_score(question, hit);
+        let boost = query_feature_score(question, &hit.source_path, &hit.snippet).weighted_total();
         if boost > 0 {
             hit.score = hit.score.saturating_add(boost.min(30) as u8).min(99);
-            hit.reasons
-                .push(format!("locomo query-feature boost={boost}"));
+            hit.reasons.push(format!("query-feature boost={boost}"));
         }
     }
     hits.sort_by(|left, right| {
@@ -1579,6 +1483,11 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
     let mut top50_saturated_questions = 0usize;
     let mut candidate_pool_min = usize::MAX;
     let mut candidate_pool_max = 0usize;
+    let mut gold_absent_from_candidates = 0usize;
+    let mut gold_present_pre_rerank_outside_top10 = 0usize;
+    let mut gold_present_final_top10_outside_top5 = 0usize;
+    let mut gold_moved_down_by_rerank = 0usize;
+    let mut two_stage_session_misses = 0usize;
     let mut category_metrics = BTreeMap::<String, [usize; 5]>::new();
     let host_context = HostContext::new(host);
 
@@ -1609,7 +1518,7 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
             let Some(question) = qa.get("question").and_then(Value::as_str) else {
                 continue;
             };
-            let evidence = qa
+            let raw_evidence = qa
                 .get("evidence")
                 .and_then(Value::as_array)
                 .map(|items| {
@@ -1620,10 +1529,11 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
                         .collect::<BTreeSet<_>>()
                 })
                 .unwrap_or_default();
-            if evidence.is_empty() {
+            if raw_evidence.is_empty() {
                 continue;
             }
-            let evidence = locomo_evidence_ids(&evidence, &granularity);
+            let evidence = locomo_evidence_ids(&raw_evidence, &granularity);
+            let evidence_sessions = locomo_evidence_ids(&raw_evidence, "session");
             if evidence.is_empty() {
                 continue;
             }
@@ -1643,6 +1553,15 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
                 FactQueryScope::All,
                 &InMemoryFactStore::today_iso_utc(),
             );
+            let mut pre_rerank_plan = retrieval_plan.clone();
+            pre_rerank_plan.enable_rerank = false;
+            let pre_rerank_hits = harness.retriever.index_hits(
+                &harness.index,
+                &request,
+                &pre_rerank_plan,
+                &fact_hints,
+                initial_candidate_pool,
+            );
             let mut hits = harness.retriever.index_hits(
                 &harness.index,
                 &request,
@@ -1656,70 +1575,109 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
             if query_feature_rerank != "off" {
                 locomo_rerank_hits_by_query_features(question, &mut hits, &query_feature_rerank);
             }
-            let (hits, candidate_pool_size) = if granularity == "dialog" && fusion == "two-stage" {
-                let session_candidates = hits
-                    .iter()
-                    .take(5)
-                    .map(|hit| hit.chunk_id.clone())
-                    .collect::<BTreeSet<_>>();
-                let dialog_index = locomo_restricted_dialog_index_for_sample(
-                    sample_index,
-                    sample,
-                    &project.id,
-                    &state.spaces,
-                    &session_candidates,
-                    &embedding,
-                    dialog_window,
-                )?;
-                let mut dialog_harness = standard_harness();
-                dialog_harness.registry = state.registry.clone();
-                dialog_harness.graph = state.spaces.clone();
-                dialog_harness.facts = state.facts.clone();
-                dialog_harness.index = dialog_index;
-                let request = QueryRequest {
-                    text: question.to_string(),
-                    project_id: project.id.clone(),
-                    task_kind: TaskKind::Query,
-                    seed_space: agent.habitat.watch_spaces.iter().next().cloned(),
-                };
-                let retrieval_plan = dialog_harness.retriever.plan(
-                    &dialog_harness.graph,
-                    &project,
-                    &agent,
-                    &host_context,
-                    &request,
-                );
-                let fact_hints = dialog_harness.facts.rerank_hints_for_query_scoped(
-                    question,
-                    FactQueryScope::All,
-                    &InMemoryFactStore::today_iso_utc(),
-                );
-                let mut hits = dialog_harness.retriever.index_hits(
-                    &dialog_harness.index,
-                    &request,
-                    &retrieval_plan,
-                    &fact_hints,
-                    50,
-                );
-                for hit in &mut hits {
-                    hit.space_path = dialog_harness.graph.path_labels(&hit.space_id);
-                }
-                if query_feature_rerank != "off" {
-                    locomo_rerank_hits_by_query_features(
-                        question,
-                        &mut hits,
-                        &query_feature_rerank,
+            let (hits, candidate_pool_size, pre_rerank_hits, session_stage_miss) =
+                if granularity == "dialog" && fusion == "two-stage" {
+                    let session_candidates = hits
+                        .iter()
+                        .take(5)
+                        .map(|hit| hit.chunk_id.clone())
+                        .collect::<BTreeSet<_>>();
+                    let session_stage_miss = !evidence_sessions.is_empty()
+                        && session_candidates
+                            .intersection(&evidence_sessions)
+                            .next()
+                            .is_none();
+                    let dialog_index = locomo_restricted_dialog_index_for_sample(
+                        sample_index,
+                        sample,
+                        &project.id,
+                        &state.spaces,
+                        &session_candidates,
+                        &embedding,
+                        dialog_window,
+                    )?;
+                    let mut dialog_harness = standard_harness();
+                    dialog_harness.registry = state.registry.clone();
+                    dialog_harness.graph = state.spaces.clone();
+                    dialog_harness.facts = state.facts.clone();
+                    dialog_harness.index = dialog_index;
+                    let request = QueryRequest {
+                        text: question.to_string(),
+                        project_id: project.id.clone(),
+                        task_kind: TaskKind::Query,
+                        seed_space: agent.habitat.watch_spaces.iter().next().cloned(),
+                    };
+                    let retrieval_plan = dialog_harness.retriever.plan(
+                        &dialog_harness.graph,
+                        &project,
+                        &agent,
+                        &host_context,
+                        &request,
                     );
-                }
-                (hits, dialog_harness.index.chunks.len())
-            } else {
-                (hits, initial_candidate_pool)
-            };
+                    let fact_hints = dialog_harness.facts.rerank_hints_for_query_scoped(
+                        question,
+                        FactQueryScope::All,
+                        &InMemoryFactStore::today_iso_utc(),
+                    );
+                    let dialog_candidate_pool = dialog_harness.index.chunks.len();
+                    let mut pre_rerank_plan = retrieval_plan.clone();
+                    pre_rerank_plan.enable_rerank = false;
+                    let pre_rerank_hits = dialog_harness.retriever.index_hits(
+                        &dialog_harness.index,
+                        &request,
+                        &pre_rerank_plan,
+                        &fact_hints,
+                        dialog_candidate_pool,
+                    );
+                    let mut hits = dialog_harness.retriever.index_hits(
+                        &dialog_harness.index,
+                        &request,
+                        &retrieval_plan,
+                        &fact_hints,
+                        50,
+                    );
+                    for hit in &mut hits {
+                        hit.space_path = dialog_harness.graph.path_labels(&hit.space_id);
+                    }
+                    if query_feature_rerank != "off" {
+                        locomo_rerank_hits_by_query_features(
+                            question,
+                            &mut hits,
+                            &query_feature_rerank,
+                        );
+                    }
+                    (
+                        hits,
+                        dialog_candidate_pool,
+                        pre_rerank_hits,
+                        session_stage_miss,
+                    )
+                } else {
+                    (hits, initial_candidate_pool, pre_rerank_hits, false)
+                };
             answered_questions += 1;
             candidate_pool_min = candidate_pool_min.min(candidate_pool_size);
             candidate_pool_max = candidate_pool_max.max(candidate_pool_size);
             if candidate_pool_size <= 50 {
                 top50_saturated_questions += 1;
+            }
+            if session_stage_miss {
+                two_stage_session_misses += 1;
+            }
+            let pre_rerank_rank = first_evidence_rank(&pre_rerank_hits, &evidence);
+            let final_rank = first_evidence_rank(&hits, &evidence);
+            match pre_rerank_rank {
+                Some(rank) if rank > 10 => gold_present_pre_rerank_outside_top10 += 1,
+                None => gold_absent_from_candidates += 1,
+                _ => {}
+            }
+            if matches!(final_rank, Some(6..=10)) {
+                gold_present_final_top10_outside_top5 += 1;
+            }
+            if pre_rerank_rank
+                .is_some_and(|rank| final_rank.is_none_or(|final_rank| final_rank > rank))
+            {
+                gold_moved_down_by_rerank += 1;
             }
             let category = qa
                 .get("category")
@@ -1867,6 +1825,26 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
                 (
                     "recall_at_50_saturated".to_string(),
                     (top50_saturated_questions > 0).to_string(),
+                ),
+                (
+                    "gold_absent_from_candidates".to_string(),
+                    gold_absent_from_candidates.to_string(),
+                ),
+                (
+                    "gold_present_pre_rerank_outside_top10".to_string(),
+                    gold_present_pre_rerank_outside_top10.to_string(),
+                ),
+                (
+                    "gold_present_final_top10_outside_top5".to_string(),
+                    gold_present_final_top10_outside_top5.to_string(),
+                ),
+                (
+                    "gold_moved_down_by_rerank".to_string(),
+                    gold_moved_down_by_rerank.to_string(),
+                ),
+                (
+                    "two_stage_session_misses".to_string(),
+                    two_stage_session_misses.to_string(),
                 ),
                 (
                     "evidence_hits_at_1".to_string(),

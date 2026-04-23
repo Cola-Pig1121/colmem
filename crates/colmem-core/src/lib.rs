@@ -38,8 +38,9 @@ pub use record::{
     VectorIndex,
 };
 pub use rerank::{
-    ExternalRerankModel, LightweightReranker, RerankCandidate, RerankFactHint,
+    ExternalRerankModel, LightweightReranker, QueryFeatureScore, RerankCandidate, RerankFactHint,
     RerankModelCandidate, RerankModelRequest, RerankModelScore, RerankResult, SourceKind,
+    query_feature_score,
 };
 pub use retrieval::{HybridRetriever, QueryRequest, RetrievalMode, RetrievalPlan, SearchHit};
 pub use space::{SpaceGraph, SpaceLink, SpaceLinkKind, SpaceNode};

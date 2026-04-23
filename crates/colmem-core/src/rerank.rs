@@ -2,6 +2,137 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::TaskKind;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueryFeatureScore {
+    pub entity_matches: usize,
+    pub temporal_matches: usize,
+    pub quoted_phrase_matches: usize,
+    pub rare_token_matches: usize,
+}
+
+impl QueryFeatureScore {
+    pub fn weighted_total(&self) -> usize {
+        self.entity_matches * 5
+            + self.temporal_matches * 4
+            + self.quoted_phrase_matches * 12
+            + self.rare_token_matches * 2
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.weighted_total() == 0
+    }
+}
+
+fn query_feature_tokens(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| token.len() > 1)
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn quoted_phrases(text: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    for quote in ['"', '\''] {
+        for (index, phrase) in text.split(quote).enumerate() {
+            if index % 2 == 1 {
+                let phrase = phrase.trim().to_ascii_lowercase();
+                if phrase.len() > 2 {
+                    phrases.push(phrase);
+                }
+            }
+        }
+    }
+    phrases
+}
+
+fn entity_terms(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| token.chars().next().is_some_and(char::is_uppercase))
+        .filter(|token| {
+            !matches!(
+                *token,
+                "What"
+                    | "When"
+                    | "Where"
+                    | "Who"
+                    | "How"
+                    | "Which"
+                    | "Did"
+                    | "Do"
+                    | "Was"
+                    | "Were"
+                    | "Is"
+                    | "Are"
+                    | "The"
+            )
+        })
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn temporal_terms(text: &str) -> Vec<String> {
+    query_feature_tokens(text)
+        .into_iter()
+        .filter(|token| {
+            token.chars().all(|ch| ch.is_ascii_digit())
+                || matches!(
+                    token.as_str(),
+                    "monday"
+                        | "tuesday"
+                        | "wednesday"
+                        | "thursday"
+                        | "friday"
+                        | "saturday"
+                        | "sunday"
+                        | "january"
+                        | "february"
+                        | "march"
+                        | "april"
+                        | "may"
+                        | "june"
+                        | "july"
+                        | "august"
+                        | "september"
+                        | "october"
+                        | "november"
+                        | "december"
+                        | "yesterday"
+                        | "tomorrow"
+                        | "week"
+                        | "month"
+                        | "year"
+                )
+        })
+        .collect()
+}
+
+pub fn query_feature_score(query: &str, source_path: &str, text: &str) -> QueryFeatureScore {
+    let query_tokens = query_feature_tokens(query);
+    let entities = entity_terms(query);
+    let temporal = temporal_terms(query);
+    let quotes = quoted_phrases(query);
+    let haystack = format!("{source_path} {text}").to_ascii_lowercase();
+
+    QueryFeatureScore {
+        entity_matches: entities
+            .iter()
+            .filter(|entity| haystack.contains(entity.as_str()))
+            .count(),
+        temporal_matches: temporal
+            .iter()
+            .filter(|term| haystack.contains(term.as_str()))
+            .count(),
+        quoted_phrase_matches: quotes
+            .iter()
+            .filter(|phrase| haystack.contains(phrase.as_str()))
+            .count(),
+        rare_token_matches: query_tokens
+            .iter()
+            .filter(|token| token.len() >= 6 && haystack.contains(token.as_str()))
+            .count(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RerankModelCandidate {
     pub chunk_id: String,
@@ -684,6 +815,7 @@ mod tests {
     use super::{
         FactQueryConfig, LightweightRerankPolicy, LightweightReranker, ModuleAffinityFamily,
         PrimitiveScoreConfig, RerankCandidate, RerankFactHint, SourceKind, SourceWeightConfig,
+        query_feature_score,
     };
 
     #[test]
@@ -1082,5 +1214,30 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("query matched source path"))
         );
+    }
+
+    #[test]
+    fn query_feature_score_matches_entities_temporal_and_quotes() {
+        let score = query_feature_score(
+            r#"When did Caroline say "blue lantern" in April?"#,
+            "memory/session.txt",
+            r#"Session date: 2026 April 13. Caroline said "blue lantern" after lunch."#,
+        );
+
+        assert!(score.entity_matches >= 1);
+        assert!(score.temporal_matches >= 1);
+        assert!(score.quoted_phrase_matches >= 1);
+        assert!(score.weighted_total() > 0);
+    }
+
+    #[test]
+    fn query_feature_score_avoids_unrelated_abstract_overboost() {
+        let score = query_feature_score(
+            "How should we reason about memory quality?",
+            "notes/session.txt",
+            "Alice discussed lunch plans and train tickets.",
+        );
+
+        assert_eq!(score.weighted_total(), 0);
     }
 }

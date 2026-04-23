@@ -437,26 +437,28 @@ impl HybridRetriever {
         let mut posting_hits_by_chunk = BTreeMap::<String, usize>::new();
         let mut vector_similarity_by_chunk = BTreeMap::<String, f32>::new();
 
-        for token in &query_tokens {
-            if let Some(postings) = index.full_text.postings.get(token) {
-                for posting in postings {
-                    if !chunk_lookup.contains_key(&posting.chunk_id) {
-                        continue;
+        if plan.enable_full_text {
+            for token in &query_tokens {
+                if let Some(postings) = index.full_text.postings.get(token) {
+                    for posting in postings {
+                        if !chunk_lookup.contains_key(&posting.chunk_id) {
+                            continue;
+                        }
+                        *score_map.entry(posting.chunk_id.clone()).or_insert(0) +=
+                            8 + i32::from(posting.frequency.min(5)) * 3;
+                        matched_by_chunk
+                            .entry(posting.chunk_id.clone())
+                            .or_default()
+                            .insert(token.clone());
+                        *posting_hits_by_chunk
+                            .entry(posting.chunk_id.clone())
+                            .or_insert(0) += 1;
                     }
-                    *score_map.entry(posting.chunk_id.clone()).or_insert(0) +=
-                        8 + i32::from(posting.frequency.min(5)) * 3;
-                    matched_by_chunk
-                        .entry(posting.chunk_id.clone())
-                        .or_default()
-                        .insert(token.clone());
-                    *posting_hits_by_chunk
-                        .entry(posting.chunk_id.clone())
-                        .or_insert(0) += 1;
                 }
             }
         }
 
-        if !query_vector.is_empty() {
+        if plan.enable_vectors && !query_vector.is_empty() {
             for (chunk_id, values) in &vector_lookup {
                 let similarity = Self::cosine_similarity(&query_vector, values);
                 if similarity < 0.18 {
@@ -575,38 +577,56 @@ impl HybridRetriever {
                 ))
             })
             .collect::<Vec<_>>();
-        let reranked = self.reranker.rerank(
-            &request.task_kind,
-            &query_tokens,
-            fact_hints,
-            candidates
-                .iter()
-                .map(|(candidate, _)| candidate.clone())
-                .collect(),
-        );
-        let rerank_lookup = reranked
-            .into_iter()
-            .map(|result| (result.chunk_id.clone(), result))
-            .collect::<BTreeMap<_, _>>();
+        let mut hits = if plan.enable_rerank {
+            let empty_fact_hints = Vec::new();
+            let effective_fact_hints = if plan.enable_facts {
+                fact_hints
+            } else {
+                &empty_fact_hints
+            };
+            let reranked = self.reranker.rerank(
+                &request.task_kind,
+                &query_tokens,
+                effective_fact_hints,
+                candidates
+                    .iter()
+                    .map(|(candidate, _)| candidate.clone())
+                    .collect(),
+            );
+            let rerank_lookup = reranked
+                .into_iter()
+                .map(|result| (result.chunk_id.clone(), result))
+                .collect::<BTreeMap<_, _>>();
 
-        let mut hits = candidates
-            .into_iter()
-            .filter_map(|(_, mut hit)| {
-                let result = rerank_lookup.get(&hit.chunk_id)?;
-                hit.score = result.final_score;
-                hit.reasons = result.reasons.clone();
-                Some(hit)
-            })
-            .collect::<Vec<_>>();
+            candidates
+                .into_iter()
+                .filter_map(|(_, mut hit)| {
+                    let result = rerank_lookup.get(&hit.chunk_id)?;
+                    hit.score = result.final_score;
+                    hit.reasons = result.reasons.clone();
+                    Some(hit)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            candidates
+                .into_iter()
+                .map(|(candidate, mut hit)| {
+                    hit.score = candidate.base_score.clamp(1, 99) as u8;
+                    hit.reasons = candidate.initial_reasons;
+                    hit
+                })
+                .collect::<Vec<_>>()
+        };
+        let facts_enabled_for_tiebreak = plan.enable_facts && !fact_hints.is_empty();
         hits.sort_by(|left, right| {
             right
                 .score
                 .cmp(&left.score)
                 .then_with(|| {
-                    Self::source_tiebreak_priority(&query_tokens, !fact_hints.is_empty(), right)
+                    Self::source_tiebreak_priority(&query_tokens, facts_enabled_for_tiebreak, right)
                         .cmp(&Self::source_tiebreak_priority(
                             &query_tokens,
-                            !fact_hints.is_empty(),
+                            facts_enabled_for_tiebreak,
                             left,
                         ))
                 })
@@ -752,6 +772,95 @@ mod tests {
                 .map(|hit| hit.memory_path_match_count > 0)
                 .unwrap_or(false)
         );
+    }
+
+    #[test]
+    fn index_hits_honors_disabled_facts_in_final_tiebreak() {
+        let retriever = HybridRetriever::default();
+        let index = IndexState {
+            version: 1,
+            full_text: FullTextIndex {
+                version: 1,
+                postings: BTreeMap::from([(
+                    "memory".to_string(),
+                    vec![
+                        TokenPosting {
+                            chunk_id: "doc".to_string(),
+                            frequency: 1,
+                        },
+                        TokenPosting {
+                            chunk_id: "other".to_string(),
+                            frequency: 1,
+                        },
+                    ],
+                )]),
+            },
+            vector: VectorIndex {
+                version: 1,
+                dimensions: 0,
+                chunks: Vec::new(),
+            },
+            records: Vec::new(),
+            chunks: vec![
+                Chunk {
+                    id: "doc".to_string(),
+                    record_id: "record-doc".to_string(),
+                    project_id: "colmem".to_string(),
+                    source_path: "docs/memory.txt".to_string(),
+                    source_kind: crate::record::ChunkSourceKind::Documentation,
+                    ordinal: 0,
+                    line_start: 1,
+                    line_end: 1,
+                    char_count: 20,
+                    text: "memory calibration".to_string(),
+                    space_ids: BTreeSet::from(["retrieval".to_string()]),
+                    space_paths: BTreeMap::new(),
+                    hash: "doc".to_string(),
+                },
+                Chunk {
+                    id: "other".to_string(),
+                    record_id: "record-other".to_string(),
+                    project_id: "colmem".to_string(),
+                    source_path: "notes/memory.log".to_string(),
+                    source_kind: crate::record::ChunkSourceKind::Documentation,
+                    ordinal: 1,
+                    line_start: 1,
+                    line_end: 1,
+                    char_count: 20,
+                    text: "memory calibration".to_string(),
+                    space_ids: BTreeSet::from(["retrieval".to_string()]),
+                    space_paths: BTreeMap::new(),
+                    hash: "other".to_string(),
+                },
+            ],
+        };
+        let request = QueryRequest {
+            text: "memory".to_string(),
+            project_id: "colmem".to_string(),
+            task_kind: TaskKind::Query,
+            seed_space: Some("retrieval".to_string()),
+        };
+        let fact_hints = vec![RerankFactHint {
+            summary: "memory fact".to_string(),
+            tokens: vec!["memory".to_string()],
+            confidence: 90,
+            reason: None,
+        }];
+        let mut plan = RetrievalPlan {
+            mode: RetrievalMode::Hybrid,
+            candidate_spaces: BTreeSet::from(["retrieval".to_string()]),
+            enable_full_text: true,
+            enable_vectors: false,
+            enable_facts: false,
+            enable_rerank: false,
+            notes: Vec::new(),
+        };
+        let without_facts = retriever.index_hits(&index, &request, &plan, &fact_hints, 2);
+        assert_eq!(without_facts[0].chunk_id, "other");
+
+        plan.enable_facts = true;
+        let with_facts = retriever.index_hits(&index, &request, &plan, &fact_hints, 2);
+        assert_eq!(with_facts[0].chunk_id, "doc");
     }
 
     #[test]
