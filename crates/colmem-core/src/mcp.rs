@@ -458,6 +458,33 @@ fn context_pack_schema() -> Value {
     })
 }
 
+fn grounding_diagnostics_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": { "type": "string", "enum": ["answerable", "under_supported", "abstain"] },
+            "evidence_strength": { "type": "integer" },
+            "supporting_hit_count": { "type": "integer" },
+            "citation_count": { "type": "integer" },
+            "relevant_fact_count": { "type": "integer" },
+            "conflict_fact_count": { "type": "integer" },
+            "temporal_ambiguity": { "type": "boolean" },
+            "reasons": string_array_schema()
+        },
+        "required": [
+            "status",
+            "evidence_strength",
+            "supporting_hit_count",
+            "citation_count",
+            "relevant_fact_count",
+            "conflict_fact_count",
+            "temporal_ambiguity",
+            "reasons"
+        ],
+        "additionalProperties": true
+    })
+}
+
 fn memory_map_schema() -> Value {
     json!({
         "type": "object",
@@ -645,10 +672,11 @@ fn tools_payload() -> Value {
                         },
                         "retrieval_plan": retrieval_plan_schema(),
                         "context_pack": context_pack_schema(),
+                        "grounding_diagnostics": grounding_diagnostics_schema(),
                         "selected_capabilities": capability_selection_schema(),
                         "evolution_preview": evolution_preview_schema()
                     },
-                    "required": ["selected_agent", "retrieval_plan", "context_pack"],
+                    "required": ["selected_agent", "retrieval_plan", "context_pack", "grounding_diagnostics"],
                     "additionalProperties": true
                 })
             ),
@@ -1509,6 +1537,8 @@ mod tests {
         assert_eq!(snapshot["fact_scope"], json!("active"));
         assert_eq!(snapshot["fact_reference_date"], json!("2026-04-09"));
         assert_eq!(snapshot["relevant_facts"][0]["status"], json!("active"));
+        assert!(snapshot["grounding_diagnostics"].is_object());
+        assert!(snapshot["grounding_diagnostics"]["status"].is_string());
     }
 
     #[test]

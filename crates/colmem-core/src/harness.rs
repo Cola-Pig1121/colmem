@@ -99,6 +99,68 @@ impl CapabilitySelection {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroundingStatus {
+    Answerable,
+    UnderSupported,
+    Abstain,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroundingDiagnostics {
+    pub status: GroundingStatus,
+    pub evidence_strength: u8,
+    pub supporting_hit_count: usize,
+    pub citation_count: usize,
+    pub relevant_fact_count: usize,
+    pub conflict_fact_count: usize,
+    pub temporal_ambiguity: bool,
+    pub reasons: Vec<String>,
+}
+
+impl GroundingDiagnostics {
+    pub fn to_json(&self) -> String {
+        json_object([
+            (
+                "status".to_string(),
+                quote(match self.status {
+                    GroundingStatus::Answerable => "answerable",
+                    GroundingStatus::UnderSupported => "under_supported",
+                    GroundingStatus::Abstain => "abstain",
+                }),
+            ),
+            (
+                "evidence_strength".to_string(),
+                self.evidence_strength.to_string(),
+            ),
+            (
+                "supporting_hit_count".to_string(),
+                self.supporting_hit_count.to_string(),
+            ),
+            (
+                "citation_count".to_string(),
+                self.citation_count.to_string(),
+            ),
+            (
+                "relevant_fact_count".to_string(),
+                self.relevant_fact_count.to_string(),
+            ),
+            (
+                "conflict_fact_count".to_string(),
+                self.conflict_fact_count.to_string(),
+            ),
+            (
+                "temporal_ambiguity".to_string(),
+                self.temporal_ambiguity.to_string(),
+            ),
+            (
+                "reasons".to_string(),
+                json_array(self.reasons.iter().map(|reason| quote(reason))),
+            ),
+        ])
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HarnessSnapshot {
     pub selected_agent: String,
@@ -110,6 +172,7 @@ pub struct HarnessSnapshot {
     pub hits: Vec<SearchHit>,
     pub relevant_facts: Vec<Fact>,
     pub context_pack: ContextPack,
+    pub grounding_diagnostics: GroundingDiagnostics,
     pub evolution_preview: EvolutionPatch,
 }
 
@@ -149,6 +212,10 @@ impl HarnessSnapshot {
                 ),
             ),
             ("context_pack".to_string(), self.context_pack.to_json()),
+            (
+                "grounding_diagnostics".to_string(),
+                self.grounding_diagnostics.to_json(),
+            ),
             (
                 "evolution_preview".to_string(),
                 evolution_patch_json(&self.evolution_preview),
@@ -231,6 +298,158 @@ pub struct HarnessRuntimeEngine {
 }
 
 impl HarnessRuntimeEngine {
+    fn query_tokens(text: &str) -> Vec<String> {
+        text.to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .filter(|token| !token.is_empty())
+            .map(|token| token.to_string())
+            .collect()
+    }
+
+    fn query_has_temporal_signal(text: &str) -> bool {
+        Self::query_tokens(text).iter().any(|token| {
+            token.chars().all(|ch| ch.is_ascii_digit())
+                || matches!(
+                    token.as_str(),
+                    "when"
+                        | "date"
+                        | "time"
+                        | "day"
+                        | "month"
+                        | "year"
+                        | "yesterday"
+                        | "tomorrow"
+                        | "monday"
+                        | "tuesday"
+                        | "wednesday"
+                        | "thursday"
+                        | "friday"
+                        | "saturday"
+                        | "sunday"
+                        | "january"
+                        | "february"
+                        | "march"
+                        | "april"
+                        | "may"
+                        | "june"
+                        | "july"
+                        | "august"
+                        | "september"
+                        | "october"
+                        | "november"
+                        | "december"
+                )
+        })
+    }
+
+    fn predicate_is_exclusive(predicate: &str) -> bool {
+        let predicate = predicate.to_ascii_lowercase();
+        [
+            "status", "state", "owner", "date", "deadline", "location", "name", "version", "role",
+            "birthday",
+        ]
+        .iter()
+        .any(|token| predicate.contains(token))
+    }
+
+    fn conflict_fact_count(facts: &[Fact], reference_date: &str) -> usize {
+        let mut relation_objects = BTreeMap::<(String, String), BTreeSet<String>>::new();
+        for fact in facts
+            .iter()
+            .filter(|fact| fact.is_active_on(reference_date))
+        {
+            relation_objects
+                .entry((fact.subject.clone(), fact.predicate.clone()))
+                .or_default()
+                .insert(fact.object.clone());
+        }
+        relation_objects
+            .iter()
+            .filter(|((_, predicate), objects)| {
+                objects.len() > 1 && Self::predicate_is_exclusive(predicate)
+            })
+            .count()
+    }
+
+    fn grounding_diagnostics(
+        &self,
+        task: &TaskIntent,
+        hits: &[SearchHit],
+        relevant_facts: &[Fact],
+        context_pack: &ContextPack,
+        reference_date: &str,
+    ) -> GroundingDiagnostics {
+        let supporting_hit_count = hits.iter().take(3).filter(|hit| hit.score >= 60).count();
+        let citation_count = context_pack.citations.len();
+        let conflict_fact_count = Self::conflict_fact_count(relevant_facts, reference_date);
+        let temporal_ambiguity = Self::query_has_temporal_signal(&task.summary)
+            && (hits.len() > 1 || relevant_facts.len() > 1);
+        let mut evidence_strength = hits
+            .first()
+            .map(|hit| match hit.score {
+                85..=99 => 52,
+                70..=84 => 40,
+                55..=69 => 26,
+                40..=54 => 14,
+                _ => 0,
+            })
+            .unwrap_or_default();
+        evidence_strength += (supporting_hit_count.min(2) * 10) as i32;
+        evidence_strength += (citation_count.min(3) * 6) as i32;
+        evidence_strength += (relevant_facts.len().min(2) * 8) as i32;
+        evidence_strength -= (conflict_fact_count.min(2) * 24) as i32;
+        if temporal_ambiguity {
+            evidence_strength -= 12;
+        }
+        let evidence_strength = evidence_strength.clamp(0, 99) as u8;
+
+        let mut reasons = Vec::new();
+        if hits.is_empty() {
+            reasons.push("no supporting retrieval hits".to_string());
+        } else if supporting_hit_count == 0 {
+            reasons.push("retrieval hits exist but none are strongly grounded".to_string());
+        } else {
+            reasons.push(format!(
+                "strong supporting hits={supporting_hit_count}, top_score={}",
+                hits.first().map(|hit| hit.score).unwrap_or_default()
+            ));
+        }
+        if citation_count == 0 {
+            reasons.push("no citations available for answer grounding".to_string());
+        } else {
+            reasons.push(format!("citations available={citation_count}"));
+        }
+        if conflict_fact_count > 0 {
+            reasons.push(format!(
+                "conflicting active facts detected={conflict_fact_count}"
+            ));
+        }
+        if temporal_ambiguity {
+            reasons.push("query is temporally ambiguous across multiple supports".to_string());
+        }
+
+        let status = if (hits.is_empty() && relevant_facts.is_empty()) || conflict_fact_count > 0 {
+            GroundingStatus::Abstain
+        } else if evidence_strength >= 60 && supporting_hit_count > 0 {
+            GroundingStatus::Answerable
+        } else if evidence_strength >= 30 {
+            GroundingStatus::UnderSupported
+        } else {
+            GroundingStatus::Abstain
+        };
+
+        GroundingDiagnostics {
+            status,
+            evidence_strength,
+            supporting_hit_count,
+            citation_count,
+            relevant_fact_count: relevant_facts.len(),
+            conflict_fact_count,
+            temporal_ambiguity,
+            reasons,
+        }
+    }
+
     fn permission_gate_reason(
         capability: &CapabilityDescriptor,
         host: &HostContext,
@@ -806,6 +1025,13 @@ impl HarnessRuntimeEngine {
             &relevant_facts,
             fact_focus,
         );
+        let grounding_diagnostics = self.grounding_diagnostics(
+            task,
+            &context_hits,
+            &relevant_facts,
+            &context_pack,
+            reference_date,
+        );
         let evolution_preview = EvolutionPatch::from_signal(&EvolutionSignal {
             successful_capabilities: capability_selection
                 .enabled
@@ -841,6 +1067,7 @@ impl HarnessRuntimeEngine {
             hits,
             relevant_facts,
             context_pack,
+            grounding_diagnostics,
             evolution_preview,
         }
     }
@@ -861,7 +1088,7 @@ mod tests {
     use crate::retrieval::HybridRetriever;
     use crate::space::{SpaceGraph, SpaceLink, SpaceLinkKind, SpaceNode};
 
-    use super::{HarnessRuntimeEngine, TaskIntent};
+    use super::{GroundingStatus, HarnessRuntimeEngine, TaskIntent};
 
     fn test_agent() -> AgentProfile {
         let mut domains = BTreeMap::new();
@@ -1161,6 +1388,11 @@ mod tests {
         assert!(!snapshot.context_pack.sections.is_empty());
         assert_eq!(snapshot.relevant_facts.len(), 1);
         assert!(snapshot.fact_focus);
+        assert_eq!(
+            snapshot.grounding_diagnostics.status,
+            GroundingStatus::Answerable
+        );
+        assert!(snapshot.grounding_diagnostics.evidence_strength >= 60);
         assert_eq!(snapshot.fact_scope, FactQueryScope::All);
         assert_eq!(
             snapshot
@@ -1362,6 +1594,283 @@ mod tests {
                 .entries
                 .iter()
                 .any(|entry| entry.contains("Architecture > Agent Runtime"))
+        );
+    }
+
+    #[test]
+    fn weak_evidence_query_abstains() {
+        let engine = HarnessRuntimeEngine {
+            registry: test_registry(),
+            graph: test_graph(),
+            retriever: HybridRetriever::default(),
+            facts: InMemoryFactStore::default(),
+            index: IndexState {
+                version: 1,
+                full_text: FullTextIndex {
+                    version: 1,
+                    postings: BTreeMap::new(),
+                },
+                records: Vec::new(),
+                chunks: vec![Chunk {
+                    id: "chunk-unrelated".to_string(),
+                    record_id: "record-unrelated".to_string(),
+                    project_id: "colmem".to_string(),
+                    source_path: "notes/unrelated.txt".to_string(),
+                    source_kind: ChunkSourceKind::Documentation,
+                    ordinal: 0,
+                    line_start: 1,
+                    line_end: 1,
+                    char_count: 12,
+                    text: "totally unrelated".to_string(),
+                    space_ids: BTreeSet::from(["architecture".to_string()]),
+                    space_paths: BTreeMap::new(),
+                    hash: "unrelated".to_string(),
+                }],
+                ..Default::default()
+            },
+            context_builder: ContextPackBuilder::default(),
+        };
+        let snapshot = engine.prepare_run(
+            &test_agent(),
+            &test_project(),
+            &test_host(),
+            &TaskIntent {
+                kind: TaskKind::Query,
+                summary: "who owns the launch checklist".to_string(),
+                requested_capabilities: BTreeSet::new(),
+            },
+        );
+
+        assert!(snapshot.hits.is_empty());
+        assert_eq!(
+            snapshot.grounding_diagnostics.status,
+            GroundingStatus::Abstain
+        );
+        assert!(
+            snapshot
+                .grounding_diagnostics
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("no supporting retrieval hits"))
+        );
+    }
+
+    #[test]
+    fn conflicting_evidence_abstains() {
+        let mut facts = InMemoryFactStore::default();
+        facts.add_fact(Fact {
+            subject: "project".to_string(),
+            predicate: "status".to_string(),
+            object: "green".to_string(),
+            valid_from: Some("2026-04-09".to_string()),
+            valid_to: None,
+            confidence: 80,
+            evidence_ids: vec!["fact-green".to_string()],
+        });
+        facts.add_fact(Fact {
+            subject: "project".to_string(),
+            predicate: "status".to_string(),
+            object: "red".to_string(),
+            valid_from: Some("2026-04-10".to_string()),
+            valid_to: None,
+            confidence: 80,
+            evidence_ids: vec!["fact-red".to_string()],
+        });
+        let engine = HarnessRuntimeEngine {
+            registry: test_registry(),
+            graph: test_graph(),
+            retriever: HybridRetriever::default(),
+            facts,
+            index: IndexState {
+                version: 1,
+                full_text: FullTextIndex {
+                    version: 1,
+                    postings: BTreeMap::from([
+                        (
+                            "project".to_string(),
+                            vec![TokenPosting {
+                                chunk_id: "chunk-status".to_string(),
+                                frequency: 1,
+                            }],
+                        ),
+                        (
+                            "status".to_string(),
+                            vec![TokenPosting {
+                                chunk_id: "chunk-status".to_string(),
+                                frequency: 1,
+                            }],
+                        ),
+                    ]),
+                },
+                records: Vec::new(),
+                chunks: vec![Chunk {
+                    id: "chunk-status".to_string(),
+                    record_id: "record-status".to_string(),
+                    project_id: "colmem".to_string(),
+                    source_path: "notes/status.txt".to_string(),
+                    source_kind: ChunkSourceKind::Documentation,
+                    ordinal: 0,
+                    line_start: 1,
+                    line_end: 1,
+                    char_count: 22,
+                    text: "project status changed".to_string(),
+                    space_ids: BTreeSet::from(["facts".to_string()]),
+                    space_paths: BTreeMap::new(),
+                    hash: "status".to_string(),
+                }],
+                ..Default::default()
+            },
+            context_builder: ContextPackBuilder::default(),
+        };
+        let snapshot = engine.prepare_run(
+            &test_agent(),
+            &test_project(),
+            &test_host(),
+            &TaskIntent {
+                kind: TaskKind::Query,
+                summary: "project status".to_string(),
+                requested_capabilities: BTreeSet::new(),
+            },
+        );
+
+        assert_eq!(
+            snapshot.grounding_diagnostics.status,
+            GroundingStatus::Abstain
+        );
+        assert_eq!(snapshot.grounding_diagnostics.conflict_fact_count, 1);
+    }
+
+    #[test]
+    fn conflicting_evidence_abstains_even_with_high_strength() {
+        let mut facts = InMemoryFactStore::default();
+        facts.add_fact(Fact {
+            subject: "release".to_string(),
+            predicate: "date".to_string(),
+            object: "2026-04-20".to_string(),
+            valid_from: Some("2026-04-09".to_string()),
+            valid_to: None,
+            confidence: 92,
+            evidence_ids: vec!["fact-date-a".to_string()],
+        });
+        facts.add_fact(Fact {
+            subject: "release".to_string(),
+            predicate: "date".to_string(),
+            object: "2026-04-22".to_string(),
+            valid_from: Some("2026-04-10".to_string()),
+            valid_to: None,
+            confidence: 92,
+            evidence_ids: vec!["fact-date-b".to_string()],
+        });
+        let engine = HarnessRuntimeEngine {
+            registry: test_registry(),
+            graph: test_graph(),
+            retriever: HybridRetriever::default(),
+            facts,
+            index: IndexState {
+                version: 1,
+                full_text: FullTextIndex {
+                    version: 1,
+                    postings: BTreeMap::from([
+                        (
+                            "release".to_string(),
+                            vec![TokenPosting {
+                                chunk_id: "chunk-release".to_string(),
+                                frequency: 2,
+                            }],
+                        ),
+                        (
+                            "date".to_string(),
+                            vec![TokenPosting {
+                                chunk_id: "chunk-release".to_string(),
+                                frequency: 2,
+                            }],
+                        ),
+                    ]),
+                },
+                records: Vec::new(),
+                chunks: vec![Chunk {
+                    id: "chunk-release".to_string(),
+                    record_id: "record-release".to_string(),
+                    project_id: "colmem".to_string(),
+                    source_path: "docs/release.txt".to_string(),
+                    source_kind: ChunkSourceKind::Documentation,
+                    ordinal: 0,
+                    line_start: 1,
+                    line_end: 2,
+                    char_count: 64,
+                    text: "release date decision log and release date planning notes".to_string(),
+                    space_ids: BTreeSet::from(["facts".to_string()]),
+                    space_paths: BTreeMap::new(),
+                    hash: "release".to_string(),
+                }],
+                ..Default::default()
+            },
+            context_builder: ContextPackBuilder::default(),
+        };
+        let snapshot = engine.prepare_run(
+            &test_agent(),
+            &test_project(),
+            &test_host(),
+            &TaskIntent {
+                kind: TaskKind::Query,
+                summary: "when is the release date".to_string(),
+                requested_capabilities: BTreeSet::new(),
+            },
+        );
+
+        assert!(!snapshot.hits.is_empty());
+        assert!(snapshot.grounding_diagnostics.citation_count > 0);
+        assert_eq!(snapshot.grounding_diagnostics.conflict_fact_count, 1);
+        assert_eq!(
+            snapshot.grounding_diagnostics.status,
+            GroundingStatus::Abstain
+        );
+    }
+
+    #[test]
+    fn multi_value_support_facts_remain_answerable() {
+        let mut facts = InMemoryFactStore::default();
+        facts.add_fact(Fact {
+            subject: "colmem".to_string(),
+            predicate: "supports".to_string(),
+            object: "mcp".to_string(),
+            valid_from: Some("2026-04-09".to_string()),
+            valid_to: None,
+            confidence: 90,
+            evidence_ids: vec!["fact-mcp".to_string()],
+        });
+        facts.add_fact(Fact {
+            subject: "colmem".to_string(),
+            predicate: "supports".to_string(),
+            object: "cursor".to_string(),
+            valid_from: Some("2026-04-10".to_string()),
+            valid_to: None,
+            confidence: 90,
+            evidence_ids: vec!["fact-cursor".to_string()],
+        });
+        let engine = HarnessRuntimeEngine {
+            registry: test_registry(),
+            graph: test_graph(),
+            retriever: HybridRetriever::default(),
+            facts,
+            index: IndexState::default(),
+            context_builder: ContextPackBuilder::default(),
+        };
+        let snapshot = engine.prepare_run(
+            &test_agent(),
+            &test_project(),
+            &test_host(),
+            &TaskIntent {
+                kind: TaskKind::Query,
+                summary: "what does colmem support".to_string(),
+                requested_capabilities: BTreeSet::new(),
+            },
+        );
+
+        assert_eq!(snapshot.grounding_diagnostics.conflict_fact_count, 0);
+        assert_eq!(
+            snapshot.grounding_diagnostics.status,
+            GroundingStatus::Answerable
         );
     }
 }
