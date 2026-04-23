@@ -128,6 +128,13 @@ impl SearchHit {
 }
 
 #[derive(Clone, Debug)]
+pub struct RetrievalDiagnostics {
+    pub hits: Vec<SearchHit>,
+    pub pre_rerank_hits: Vec<SearchHit>,
+    pub candidate_count: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct HybridRetriever {
     pub default_mode: RetrievalMode,
     pub reranker: LightweightReranker,
@@ -398,6 +405,29 @@ impl HybridRetriever {
             .collect()
     }
 
+    fn sort_hits(
+        hits: &mut [SearchHit],
+        query_tokens: &[String],
+        facts_enabled_for_tiebreak: bool,
+    ) {
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| {
+                    Self::source_tiebreak_priority(query_tokens, facts_enabled_for_tiebreak, right)
+                        .cmp(&Self::source_tiebreak_priority(
+                            query_tokens,
+                            facts_enabled_for_tiebreak,
+                            left,
+                        ))
+                })
+                .then_with(|| left.source_path.cmp(&right.source_path))
+                .then_with(|| left.ordinal.cmp(&right.ordinal))
+                .then_with(|| left.chunk_id.cmp(&right.chunk_id))
+        });
+    }
+
     pub fn index_hits(
         &self,
         index: &IndexState,
@@ -406,6 +436,18 @@ impl HybridRetriever {
         fact_hints: &[RerankFactHint],
         max_results: usize,
     ) -> Vec<SearchHit> {
+        self.index_hits_with_diagnostics(index, request, plan, fact_hints, max_results)
+            .hits
+    }
+
+    pub fn index_hits_with_diagnostics(
+        &self,
+        index: &IndexState,
+        request: &QueryRequest,
+        plan: &RetrievalPlan,
+        fact_hints: &[RerankFactHint],
+        max_results: usize,
+    ) -> RetrievalDiagnostics {
         let query_tokens = Self::tokenize(&request.text);
         let query_lower = request.text.to_ascii_lowercase();
         let query_vector = if index.vector.dimensions > 0 {
@@ -577,6 +619,23 @@ impl HybridRetriever {
                 ))
             })
             .collect::<Vec<_>>();
+        let candidate_count = candidates.len();
+        let facts_enabled_for_tiebreak = plan.enable_facts && !fact_hints.is_empty();
+        let mut pre_rerank_hits = candidates
+            .iter()
+            .map(|(candidate, hit)| {
+                let mut hit = hit.clone();
+                hit.score = candidate.base_score.clamp(1, 99) as u8;
+                hit.reasons = candidate.initial_reasons.clone();
+                hit
+            })
+            .collect::<Vec<_>>();
+        Self::sort_hits(
+            &mut pre_rerank_hits,
+            &query_tokens,
+            facts_enabled_for_tiebreak,
+        );
+
         let mut hits = if plan.enable_rerank {
             let empty_fact_hints = Vec::new();
             let effective_fact_hints = if plan.enable_facts {
@@ -617,25 +676,13 @@ impl HybridRetriever {
                 })
                 .collect::<Vec<_>>()
         };
-        let facts_enabled_for_tiebreak = plan.enable_facts && !fact_hints.is_empty();
-        hits.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| {
-                    Self::source_tiebreak_priority(&query_tokens, facts_enabled_for_tiebreak, right)
-                        .cmp(&Self::source_tiebreak_priority(
-                            &query_tokens,
-                            facts_enabled_for_tiebreak,
-                            left,
-                        ))
-                })
-                .then_with(|| left.source_path.cmp(&right.source_path))
-                .then_with(|| left.ordinal.cmp(&right.ordinal))
-                .then_with(|| left.chunk_id.cmp(&right.chunk_id))
-        });
+        Self::sort_hits(&mut hits, &query_tokens, facts_enabled_for_tiebreak);
         hits.truncate(max_results);
-        hits
+        RetrievalDiagnostics {
+            hits,
+            pre_rerank_hits,
+            candidate_count,
+        }
     }
 }
 
@@ -861,6 +908,126 @@ mod tests {
         plan.enable_facts = true;
         let with_facts = retriever.index_hits(&index, &request, &plan, &fact_hints, 2);
         assert_eq!(with_facts[0].chunk_id, "doc");
+    }
+
+    #[test]
+    fn diagnostics_return_final_hits_pre_rerank_hits_and_actual_candidate_count() {
+        let retriever = HybridRetriever::default();
+        let index = IndexState {
+            version: 1,
+            full_text: FullTextIndex {
+                version: 1,
+                postings: BTreeMap::from([(
+                    "alpha".to_string(),
+                    vec![
+                        TokenPosting {
+                            chunk_id: "match-a".to_string(),
+                            frequency: 1,
+                        },
+                        TokenPosting {
+                            chunk_id: "match-b".to_string(),
+                            frequency: 1,
+                        },
+                        TokenPosting {
+                            chunk_id: "other-project".to_string(),
+                            frequency: 1,
+                        },
+                    ],
+                )]),
+            },
+            vector: VectorIndex {
+                version: 1,
+                dimensions: 0,
+                chunks: Vec::new(),
+            },
+            records: Vec::new(),
+            chunks: vec![
+                Chunk {
+                    id: "match-a".to_string(),
+                    record_id: "record-a".to_string(),
+                    project_id: "colmem".to_string(),
+                    source_path: "docs/a.txt".to_string(),
+                    source_kind: crate::record::ChunkSourceKind::Documentation,
+                    ordinal: 0,
+                    line_start: 1,
+                    line_end: 1,
+                    char_count: 16,
+                    text: "alpha memory".to_string(),
+                    space_ids: BTreeSet::from(["retrieval".to_string()]),
+                    space_paths: BTreeMap::new(),
+                    hash: "a".to_string(),
+                },
+                Chunk {
+                    id: "match-b".to_string(),
+                    record_id: "record-b".to_string(),
+                    project_id: "colmem".to_string(),
+                    source_path: "notes/b.log".to_string(),
+                    source_kind: crate::record::ChunkSourceKind::Documentation,
+                    ordinal: 1,
+                    line_start: 1,
+                    line_end: 1,
+                    char_count: 16,
+                    text: "alpha memory".to_string(),
+                    space_ids: BTreeSet::from(["retrieval".to_string()]),
+                    space_paths: BTreeMap::new(),
+                    hash: "b".to_string(),
+                },
+                Chunk {
+                    id: "miss".to_string(),
+                    record_id: "record-miss".to_string(),
+                    project_id: "colmem".to_string(),
+                    source_path: "notes/miss.log".to_string(),
+                    source_kind: crate::record::ChunkSourceKind::Documentation,
+                    ordinal: 2,
+                    line_start: 1,
+                    line_end: 1,
+                    char_count: 10,
+                    text: "unrelated".to_string(),
+                    space_ids: BTreeSet::from(["retrieval".to_string()]),
+                    space_paths: BTreeMap::new(),
+                    hash: "miss".to_string(),
+                },
+                Chunk {
+                    id: "other-project".to_string(),
+                    record_id: "record-other".to_string(),
+                    project_id: "other".to_string(),
+                    source_path: "notes/other.log".to_string(),
+                    source_kind: crate::record::ChunkSourceKind::Documentation,
+                    ordinal: 3,
+                    line_start: 1,
+                    line_end: 1,
+                    char_count: 16,
+                    text: "alpha memory".to_string(),
+                    space_ids: BTreeSet::from(["retrieval".to_string()]),
+                    space_paths: BTreeMap::new(),
+                    hash: "other".to_string(),
+                },
+            ],
+        };
+        let request = QueryRequest {
+            text: "alpha".to_string(),
+            project_id: "colmem".to_string(),
+            task_kind: TaskKind::Query,
+            seed_space: Some("retrieval".to_string()),
+        };
+        let plan = RetrievalPlan {
+            mode: RetrievalMode::Hybrid,
+            candidate_spaces: BTreeSet::from(["retrieval".to_string()]),
+            enable_full_text: true,
+            enable_vectors: false,
+            enable_facts: false,
+            enable_rerank: false,
+            notes: Vec::new(),
+        };
+
+        let diagnostics = retriever.index_hits_with_diagnostics(&index, &request, &plan, &[], 1);
+        let regular_hits = retriever.index_hits(&index, &request, &plan, &[], 1);
+
+        assert_eq!(diagnostics.candidate_count, 2);
+        assert_eq!(diagnostics.pre_rerank_hits.len(), 2);
+        assert_eq!(diagnostics.hits.len(), 1);
+        assert_eq!(diagnostics.hits[0].chunk_id, regular_hits[0].chunk_id);
+        assert_eq!(diagnostics.hits[0].score, regular_hits[0].score);
     }
 
     #[test]

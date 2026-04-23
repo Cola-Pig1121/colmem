@@ -1483,6 +1483,8 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
     let mut top50_saturated_questions = 0usize;
     let mut candidate_pool_min = usize::MAX;
     let mut candidate_pool_max = 0usize;
+    let mut candidate_pool_sum = 0usize;
+    let mut candidate_pool_sizes = Vec::<usize>::new();
     let mut gold_absent_from_candidates = 0usize;
     let mut gold_present_pre_rerank_outside_top10 = 0usize;
     let mut gold_present_final_top10_outside_top5 = 0usize;
@@ -1510,7 +1512,6 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
         harness.graph = state.spaces.clone();
         harness.facts = state.facts.clone();
         harness.index = index;
-        let initial_candidate_pool = harness.index.chunks.len();
         let Some(qa_pairs) = sample.get("qa").and_then(Value::as_array) else {
             continue;
         };
@@ -1553,22 +1554,16 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
                 FactQueryScope::All,
                 &InMemoryFactStore::today_iso_utc(),
             );
-            let mut pre_rerank_plan = retrieval_plan.clone();
-            pre_rerank_plan.enable_rerank = false;
-            let pre_rerank_hits = harness.retriever.index_hits(
-                &harness.index,
-                &request,
-                &pre_rerank_plan,
-                &fact_hints,
-                initial_candidate_pool,
-            );
-            let mut hits = harness.retriever.index_hits(
+            let diagnostics = harness.retriever.index_hits_with_diagnostics(
                 &harness.index,
                 &request,
                 &retrieval_plan,
                 &fact_hints,
                 50,
             );
+            let pre_rerank_hits = diagnostics.pre_rerank_hits;
+            let candidate_count = diagnostics.candidate_count;
+            let mut hits = diagnostics.hits;
             for hit in &mut hits {
                 hit.space_path = harness.graph.path_labels(&hit.space_id);
             }
@@ -1619,23 +1614,16 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
                         FactQueryScope::All,
                         &InMemoryFactStore::today_iso_utc(),
                     );
-                    let dialog_candidate_pool = dialog_harness.index.chunks.len();
-                    let mut pre_rerank_plan = retrieval_plan.clone();
-                    pre_rerank_plan.enable_rerank = false;
-                    let pre_rerank_hits = dialog_harness.retriever.index_hits(
-                        &dialog_harness.index,
-                        &request,
-                        &pre_rerank_plan,
-                        &fact_hints,
-                        dialog_candidate_pool,
-                    );
-                    let mut hits = dialog_harness.retriever.index_hits(
+                    let diagnostics = dialog_harness.retriever.index_hits_with_diagnostics(
                         &dialog_harness.index,
                         &request,
                         &retrieval_plan,
                         &fact_hints,
                         50,
                     );
+                    let pre_rerank_hits = diagnostics.pre_rerank_hits;
+                    let candidate_count = diagnostics.candidate_count;
+                    let mut hits = diagnostics.hits;
                     for hit in &mut hits {
                         hit.space_path = dialog_harness.graph.path_labels(&hit.space_id);
                     }
@@ -1646,18 +1634,15 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
                             &query_feature_rerank,
                         );
                     }
-                    (
-                        hits,
-                        dialog_candidate_pool,
-                        pre_rerank_hits,
-                        session_stage_miss,
-                    )
+                    (hits, candidate_count, pre_rerank_hits, session_stage_miss)
                 } else {
-                    (hits, initial_candidate_pool, pre_rerank_hits, false)
+                    (hits, candidate_count, pre_rerank_hits, false)
                 };
             answered_questions += 1;
             candidate_pool_min = candidate_pool_min.min(candidate_pool_size);
             candidate_pool_max = candidate_pool_max.max(candidate_pool_size);
+            candidate_pool_sum += candidate_pool_size;
+            candidate_pool_sizes.push(candidate_pool_size);
             if candidate_pool_size <= 50 {
                 top50_saturated_questions += 1;
             }
@@ -1730,6 +1715,16 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
         } else {
             hits as f64 / total_questions as f64
         }
+    };
+    candidate_pool_sizes.sort_unstable();
+    let candidate_pool_median = candidate_pool_sizes
+        .get(candidate_pool_sizes.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or_default();
+    let candidate_pool_avg = if answered_questions == 0 {
+        0.0
+    } else {
+        candidate_pool_sum as f64 / answered_questions as f64
     };
     let per_category = format!(
         "{{{}}}",
@@ -1817,6 +1812,14 @@ fn benchmark_locomo(args: &[String], cwd: &Path) -> Result<String, String> {
                 (
                     "candidate_pool_max".to_string(),
                     candidate_pool_max.to_string(),
+                ),
+                (
+                    "candidate_pool_median".to_string(),
+                    candidate_pool_median.to_string(),
+                ),
+                (
+                    "candidate_pool_avg".to_string(),
+                    format!("{candidate_pool_avg:.1}"),
                 ),
                 (
                     "top50_saturated_questions".to_string(),
@@ -2573,6 +2576,10 @@ mod tests {
         assert!(output.contains("\"benchmark\": \"locomo\""));
         assert!(output.contains("\"status\": \"completed\""));
         assert!(output.contains("\"questions\": 1"));
+        assert!(output.contains("\"candidate_pool_min\": 1"));
+        assert!(output.contains("\"candidate_pool_max\": 1"));
+        assert!(output.contains("\"candidate_pool_median\": 1"));
+        assert!(output.contains("\"candidate_pool_avg\": 1.0"));
         assert!(output.contains("\"query_feature_rerank\": \"off\""));
         assert!(output.contains("\"per_category\""));
         assert!(output.contains("\"single_hop\""));

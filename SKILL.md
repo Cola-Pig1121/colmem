@@ -42,7 +42,7 @@ cargo run -p colmem-cli --features remote-embeddings -- benchmark locomo --data 
 - Default signature session retrieval is the stable baseline and should stay leakage-free.
 - Dialog-level retrieval is harder because evidence is turn-local; use `--dialog-window` to test small neighbor context windows without reading answers or evidence.
 - `--fusion two-stage` and `--query-feature-rerank [balanced|conservative]` are experimental diagnostics. Do not enable them by default unless official no-limit runs show robust gains.
-- Benchmark output includes per-category recall, candidate-pool saturation flags, and miss-taxonomy counters. Treat any `recall_at_50_saturated: true` result as a diagnostic artifact, not proof of near-perfect memory; use miss taxonomy to decide whether the next fix belongs in candidate generation or reranking.
+- Benchmark output includes per-category recall, actual candidate-pool distribution, saturation flags, and miss-taxonomy counters. Treat any `recall_at_50_saturated: true` result as a diagnostic artifact, not proof of near-perfect memory; use miss taxonomy to decide whether the next fix belongs in candidate generation or reranking.
 
 ## Rerank extension point
 

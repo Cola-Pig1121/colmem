@@ -42,6 +42,8 @@ pub use rerank::{
     RerankModelCandidate, RerankModelRequest, RerankModelScore, RerankResult, SourceKind,
     query_feature_score,
 };
-pub use retrieval::{HybridRetriever, QueryRequest, RetrievalMode, RetrievalPlan, SearchHit};
+pub use retrieval::{
+    HybridRetriever, QueryRequest, RetrievalDiagnostics, RetrievalMode, RetrievalPlan, SearchHit,
+};
 pub use space::{SpaceGraph, SpaceLink, SpaceLinkKind, SpaceNode};
 pub use storage::{EvolutionRecord, WorkspacePaths, WorkspaceState, WorkspaceStateStore};
