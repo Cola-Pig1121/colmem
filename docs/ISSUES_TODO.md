@@ -31,7 +31,7 @@ This file tracks known issues, deferred fixes, and non-blocking quality gaps dis
   - Suggested phase: ingest policy refinement and retrieval quality follow-up.
 
 - `facts` are persisted through workspace state, but there is no dedicated fact backend yet.
-  - Why it matters: `FactStoreBackend` now defines the first backend boundary, `InMemoryFactStore` implements it, and CLI/MCP expose fact backend summary counts, but contradiction handling, auditing, and higher-volume fact workflows will eventually outgrow the current JSON-backed store.
+  - Why it matters: `FactStoreBackend` now defines the first backend boundary, `InMemoryFactStore` implements it, and CLI/MCP expose fact backend summary counts. A first `FactWritePolicy` layer now governs the existing CLI facts ingress with auditable `create/reinforce/supersede/invalidate/defer/reject` outcomes, but contradiction handling at larger scale and higher-volume write workflows will still outgrow the current JSON-backed store.
   - Suggested phase: Phase E.
 
 - MCP now carries fact lifecycle semantics, argument validation, field-level output schemas, and basic notification compatibility, but the wider protocol surface is still narrow.

@@ -88,8 +88,22 @@ impl Fact {
         format!("{} {} {}", self.subject, self.predicate, self.object)
     }
 
+    fn canceled_before_start(&self) -> bool {
+        matches!(
+            (self.valid_from.as_deref(), self.valid_to.as_deref()),
+            (Some(valid_from), Some(valid_to)) if valid_to < valid_from
+        )
+    }
+
     pub fn status_on(&self, reference_date: &str) -> &'static str {
-        if self
+        if self.canceled_before_start()
+            && self
+                .valid_to
+                .as_deref()
+                .is_some_and(|valid_to| valid_to <= reference_date)
+        {
+            "closed"
+        } else if self
             .valid_from
             .as_deref()
             .is_some_and(|valid_from| valid_from > reference_date)
@@ -165,6 +179,9 @@ impl Fact {
     }
 
     pub fn is_active_on(&self, reference_date: &str) -> bool {
+        if self.canceled_before_start() {
+            return false;
+        }
         let starts_before = self
             .valid_from
             .as_deref()
@@ -236,6 +253,207 @@ impl FactAuditEvent {
                     .unwrap_or_else(|| "null".to_string()),
             ),
         ])
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FactWriteDecision {
+    Create,
+    Reinforce,
+    Supersede,
+    Invalidate,
+    Defer,
+    Reject,
+}
+
+impl FactWriteDecision {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Reinforce => "reinforce",
+            Self::Supersede => "supersede",
+            Self::Invalidate => "invalidate",
+            Self::Defer => "defer",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FactWritePolicy;
+
+#[derive(Clone, Debug)]
+pub struct FactWriteResult {
+    pub decision: FactWriteDecision,
+    pub reason: String,
+    pub reference_date: String,
+    pub invalidated: usize,
+    pub fact: Option<Fact>,
+}
+
+impl FactWriteResult {
+    pub fn to_json(&self) -> String {
+        json_object([
+            ("decision".to_string(), quote(self.decision.as_str())),
+            ("reason".to_string(), quote(&self.reason)),
+            ("reference_date".to_string(), quote(&self.reference_date)),
+            ("invalidated".to_string(), self.invalidated.to_string()),
+            (
+                "fact".to_string(),
+                self.fact
+                    .as_ref()
+                    .map(Fact::to_json)
+                    .unwrap_or_else(|| "null".to_string()),
+            ),
+        ])
+    }
+}
+
+impl FactWritePolicy {
+    fn exclusive_predicate(predicate: &str) -> bool {
+        let predicate = predicate.to_ascii_lowercase();
+        [
+            "status", "state", "owner", "date", "deadline", "location", "name", "version", "role",
+            "birthday",
+        ]
+        .iter()
+        .any(|token| predicate.contains(token))
+    }
+
+    pub fn decide_add(
+        &self,
+        store: &InMemoryFactStore,
+        fact: &Fact,
+        reference_date: &str,
+    ) -> (FactWriteDecision, String) {
+        if fact.subject.trim().is_empty()
+            || fact.predicate.trim().is_empty()
+            || fact.object.trim().is_empty()
+        {
+            return (
+                FactWriteDecision::Reject,
+                "subject/predicate/object must be non-empty".to_string(),
+            );
+        }
+
+        if fact.valid_to.is_some() {
+            return (
+                FactWriteDecision::Create,
+                "bounded fact keeps its own historical or scheduled interval".to_string(),
+            );
+        }
+
+        let exact_active = store.facts.iter().any(|existing| {
+            existing.subject == fact.subject
+                && existing.predicate == fact.predicate
+                && existing.object == fact.object
+                && existing.is_active_on(reference_date)
+        });
+        if exact_active {
+            return (
+                FactWriteDecision::Reinforce,
+                "matching active fact already exists".to_string(),
+            );
+        }
+
+        let conflicting_active = store.facts.iter().any(|existing| {
+            existing.subject == fact.subject
+                && existing.predicate == fact.predicate
+                && existing.object != fact.object
+                && existing.is_active_on(reference_date)
+        });
+        if conflicting_active && Self::exclusive_predicate(&fact.predicate) {
+            return (
+                FactWriteDecision::Defer,
+                "conflicting active fact exists for an exclusive relation".to_string(),
+            );
+        }
+
+        (
+            FactWriteDecision::Create,
+            "new fact can be created".to_string(),
+        )
+    }
+
+    pub fn decide_update(
+        &self,
+        store: &InMemoryFactStore,
+        fact: &Fact,
+        effective_date: &str,
+    ) -> (FactWriteDecision, String) {
+        if fact.subject.trim().is_empty()
+            || fact.predicate.trim().is_empty()
+            || fact.object.trim().is_empty()
+        {
+            return (
+                FactWriteDecision::Reject,
+                "subject/predicate/object must be non-empty".to_string(),
+            );
+        }
+
+        let exact_active = store.facts.iter().any(|existing| {
+            existing.subject == fact.subject
+                && existing.predicate == fact.predicate
+                && existing.object == fact.object
+                && existing.is_active_on(effective_date)
+        });
+        if exact_active {
+            return (
+                FactWriteDecision::Reinforce,
+                "update matches an already active fact".to_string(),
+            );
+        }
+
+        let supersedable_relation_exists = store.facts.iter().any(|existing| {
+            existing.subject == fact.subject
+                && existing.predicate == fact.predicate
+                && existing
+                    .valid_to
+                    .as_deref()
+                    .is_none_or(|valid_to| valid_to > effective_date)
+        });
+        if supersedable_relation_exists {
+            return (
+                FactWriteDecision::Supersede,
+                "non-closed relation exists and will be superseded".to_string(),
+            );
+        }
+
+        (
+            FactWriteDecision::Create,
+            "no active relation exists, so update creates a new fact".to_string(),
+        )
+    }
+
+    pub fn decide_invalidate(
+        &self,
+        store: &InMemoryFactStore,
+        subject: &str,
+        predicate: &str,
+        object: Option<&str>,
+        effective_date: &str,
+    ) -> (FactWriteDecision, String) {
+        let invalidatable = store.facts.iter().any(|existing| {
+            existing.subject == subject
+                && existing.predicate == predicate
+                && object.is_none_or(|expected| existing.object == expected)
+                && existing
+                    .valid_to
+                    .as_deref()
+                    .is_none_or(|valid_to| valid_to > effective_date)
+        });
+
+        if invalidatable {
+            (
+                FactWriteDecision::Invalidate,
+                "matching active facts will be invalidated".to_string(),
+            )
+        } else {
+            (
+                FactWriteDecision::Reject,
+                "no matching active facts to invalidate".to_string(),
+            )
+        }
     }
 }
 
@@ -322,6 +540,264 @@ impl FactStoreBackend for InMemoryFactStore {
 }
 
 impl InMemoryFactStore {
+    fn policy_audit_event(
+        &mut self,
+        action: &str,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        effective_at: Option<String>,
+        note: impl Into<String>,
+    ) {
+        let effective_at = effective_at.or_else(|| Some(Self::today_iso_utc()));
+        self.audit_log.push(FactAuditEvent {
+            timestamp: effective_at.clone().unwrap_or_else(Self::today_iso_utc),
+            action: action.to_string(),
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            effective_at,
+            note: Some(note.into()),
+        });
+    }
+
+    fn reinforce_fact(&mut self, fact: &Fact, reference_date: &str) -> Fact {
+        let mut reinforced = None;
+        if let Some(existing) = self.facts.iter_mut().find(|existing| {
+            existing.subject == fact.subject
+                && existing.predicate == fact.predicate
+                && existing.object == fact.object
+                && existing.is_active_on(reference_date)
+        }) {
+            existing.confidence = existing.confidence.max(fact.confidence);
+            let mut evidence = existing
+                .evidence_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            evidence.extend(fact.evidence_ids.iter().cloned());
+            existing.evidence_ids = evidence.into_iter().collect();
+            reinforced = Some(existing.clone());
+        }
+        if let Some(reinforced) = reinforced {
+            self.policy_audit_event(
+                "reinforced",
+                &reinforced.subject,
+                &reinforced.predicate,
+                &reinforced.object,
+                Some(reference_date.to_string()),
+                "merged supporting evidence into active fact",
+            );
+            return reinforced;
+        }
+        fact.clone()
+    }
+
+    pub fn apply_add_with_policy(
+        &mut self,
+        policy: &FactWritePolicy,
+        fact: Fact,
+    ) -> FactWriteResult {
+        let reference_date = fact.valid_from.clone().unwrap_or_else(Self::today_iso_utc);
+        let (decision, reason) = policy.decide_add(self, &fact, &reference_date);
+        match decision {
+            FactWriteDecision::Create => {
+                self.add_fact(fact.clone());
+                self.merge_duplicate_facts();
+                FactWriteResult {
+                    decision,
+                    reason,
+                    reference_date,
+                    invalidated: 0,
+                    fact: Some(fact),
+                }
+            }
+            FactWriteDecision::Reinforce => {
+                let reinforced = self.reinforce_fact(&fact, &reference_date);
+                FactWriteResult {
+                    decision,
+                    reason,
+                    reference_date,
+                    invalidated: 0,
+                    fact: Some(reinforced),
+                }
+            }
+            FactWriteDecision::Defer => {
+                self.policy_audit_event(
+                    "deferred",
+                    &fact.subject,
+                    &fact.predicate,
+                    &fact.object,
+                    Some(reference_date.clone()),
+                    &reason,
+                );
+                FactWriteResult {
+                    decision,
+                    reason,
+                    reference_date,
+                    invalidated: 0,
+                    fact: Some(fact),
+                }
+            }
+            FactWriteDecision::Reject => {
+                self.policy_audit_event(
+                    "rejected",
+                    &fact.subject,
+                    &fact.predicate,
+                    &fact.object,
+                    Some(reference_date.clone()),
+                    &reason,
+                );
+                FactWriteResult {
+                    decision,
+                    reason,
+                    reference_date,
+                    invalidated: 0,
+                    fact: Some(fact),
+                }
+            }
+            other => FactWriteResult {
+                decision: other,
+                reason,
+                reference_date,
+                invalidated: 0,
+                fact: Some(fact),
+            },
+        }
+    }
+
+    pub fn apply_update_with_policy(
+        &mut self,
+        policy: &FactWritePolicy,
+        fact: Fact,
+        effective_date: &str,
+    ) -> FactWriteResult {
+        let (decision, reason) = policy.decide_update(self, &fact, effective_date);
+        match decision {
+            FactWriteDecision::Create => {
+                self.add_fact(fact.clone());
+                FactWriteResult {
+                    decision,
+                    reason,
+                    reference_date: effective_date.to_string(),
+                    invalidated: 0,
+                    fact: Some(fact),
+                }
+            }
+            FactWriteDecision::Reinforce => {
+                let reinforced = self.reinforce_fact(&fact, effective_date);
+                FactWriteResult {
+                    decision,
+                    reason,
+                    reference_date: effective_date.to_string(),
+                    invalidated: 0,
+                    fact: Some(reinforced),
+                }
+            }
+            FactWriteDecision::Supersede => {
+                let invalidated = self.replace_fact(fact.clone(), effective_date);
+                FactWriteResult {
+                    decision,
+                    reason,
+                    reference_date: effective_date.to_string(),
+                    invalidated,
+                    fact: Some(fact),
+                }
+            }
+            FactWriteDecision::Defer => {
+                self.policy_audit_event(
+                    "deferred",
+                    &fact.subject,
+                    &fact.predicate,
+                    &fact.object,
+                    Some(effective_date.to_string()),
+                    &reason,
+                );
+                FactWriteResult {
+                    decision,
+                    reason,
+                    reference_date: effective_date.to_string(),
+                    invalidated: 0,
+                    fact: Some(fact),
+                }
+            }
+            FactWriteDecision::Reject => {
+                self.policy_audit_event(
+                    "rejected",
+                    &fact.subject,
+                    &fact.predicate,
+                    &fact.object,
+                    Some(effective_date.to_string()),
+                    &reason,
+                );
+                FactWriteResult {
+                    decision,
+                    reason,
+                    reference_date: effective_date.to_string(),
+                    invalidated: 0,
+                    fact: Some(fact),
+                }
+            }
+            other => FactWriteResult {
+                decision: other,
+                reason,
+                reference_date: effective_date.to_string(),
+                invalidated: 0,
+                fact: Some(fact),
+            },
+        }
+    }
+
+    pub fn apply_invalidate_with_policy(
+        &mut self,
+        policy: &FactWritePolicy,
+        subject: &str,
+        predicate: &str,
+        object: Option<&str>,
+        effective_date: &str,
+    ) -> FactWriteResult {
+        let object_text = object.unwrap_or("*");
+        let (decision, reason) =
+            policy.decide_invalidate(self, subject, predicate, object, effective_date);
+        match decision {
+            FactWriteDecision::Invalidate => {
+                let invalidated =
+                    self.invalidate_matching(subject, predicate, object, effective_date);
+                FactWriteResult {
+                    decision,
+                    reason,
+                    reference_date: effective_date.to_string(),
+                    invalidated,
+                    fact: None,
+                }
+            }
+            FactWriteDecision::Reject => {
+                self.policy_audit_event(
+                    "rejected",
+                    subject,
+                    predicate,
+                    object_text,
+                    Some(effective_date.to_string()),
+                    &reason,
+                );
+                FactWriteResult {
+                    decision,
+                    reason,
+                    reference_date: effective_date.to_string(),
+                    invalidated: 0,
+                    fact: None,
+                }
+            }
+            other => FactWriteResult {
+                decision: other,
+                reason,
+                reference_date: effective_date.to_string(),
+                invalidated: 0,
+                fact: None,
+            },
+        }
+    }
+
     pub fn summary_json(&self, reference_date: &str) -> String {
         let mut active = 0usize;
         let mut history = 0usize;
@@ -558,13 +1034,6 @@ impl InMemoryFactStore {
                 continue;
             }
 
-            if fact
-                .valid_from
-                .as_deref()
-                .is_some_and(|valid_from| valid_from > effective_date)
-            {
-                fact.valid_from = Some(effective_date.to_string());
-            }
             fact.valid_to = Some(effective_date.to_string());
             self.audit_log.push(FactAuditEvent {
                 timestamp: effective_date.to_string(),
@@ -597,13 +1066,6 @@ impl InMemoryFactStore {
                 continue;
             }
 
-            if candidate
-                .valid_from
-                .as_deref()
-                .is_some_and(|valid_from| valid_from > effective_date)
-            {
-                candidate.valid_from = Some(effective_date.to_string());
-            }
             candidate.valid_to = Some(effective_date.to_string());
             self.audit_log.push(FactAuditEvent {
                 timestamp: effective_date.to_string(),
@@ -707,7 +1169,10 @@ impl InMemoryFactStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{Fact, FactQueryScope, FactStoreBackend, InMemoryFactStore};
+    use super::{
+        Fact, FactQueryScope, FactStoreBackend, FactWriteDecision, FactWritePolicy,
+        InMemoryFactStore,
+    };
 
     #[test]
     fn fact_query_requires_meaningful_overlap() {
@@ -1046,5 +1511,209 @@ mod tests {
         assert_eq!(old_fact.valid_to.as_deref(), Some("2026-04-10"));
         assert_eq!(new_fact.valid_from.as_deref(), Some("2026-04-10"));
         assert!(new_fact.valid_to.is_none());
+    }
+
+    #[test]
+    fn add_policy_reinforces_matching_active_fact() {
+        let mut store = InMemoryFactStore::default();
+        store.add_fact(Fact {
+            subject: "colmem".to_string(),
+            predicate: "supports".to_string(),
+            object: "mcp".to_string(),
+            valid_from: Some("2026-04-10".to_string()),
+            valid_to: None,
+            confidence: 70,
+            evidence_ids: vec!["old".to_string()],
+        });
+
+        let result = store.apply_add_with_policy(
+            &FactWritePolicy,
+            Fact {
+                subject: "colmem".to_string(),
+                predicate: "supports".to_string(),
+                object: "mcp".to_string(),
+                valid_from: Some("2026-04-11".to_string()),
+                valid_to: None,
+                confidence: 90,
+                evidence_ids: vec!["new".to_string()],
+            },
+        );
+
+        assert_eq!(result.decision, FactWriteDecision::Reinforce);
+        assert_eq!(store.all().len(), 1);
+        assert_eq!(store.all()[0].confidence, 90);
+        assert_eq!(store.all()[0].evidence_ids.len(), 2);
+        assert!(
+            store
+                .audit_log()
+                .iter()
+                .any(|event| event.action == "reinforced")
+        );
+    }
+
+    #[test]
+    fn add_policy_defers_conflicting_exclusive_fact() {
+        let mut store = InMemoryFactStore::default();
+        store.add_fact(Fact {
+            subject: "release".to_string(),
+            predicate: "date".to_string(),
+            object: "2026-04-20".to_string(),
+            valid_from: Some("2026-04-10".to_string()),
+            valid_to: None,
+            confidence: 90,
+            evidence_ids: vec!["first".to_string()],
+        });
+
+        let result = store.apply_add_with_policy(
+            &FactWritePolicy,
+            Fact {
+                subject: "release".to_string(),
+                predicate: "date".to_string(),
+                object: "2026-04-22".to_string(),
+                valid_from: Some("2026-04-11".to_string()),
+                valid_to: None,
+                confidence: 90,
+                evidence_ids: vec!["second".to_string()],
+            },
+        );
+
+        assert_eq!(result.decision, FactWriteDecision::Defer);
+        assert_eq!(store.all().len(), 1);
+        assert!(
+            store
+                .audit_log()
+                .iter()
+                .any(|event| event.action == "deferred")
+        );
+    }
+
+    #[test]
+    fn invalidate_policy_rejects_when_no_active_fact_exists() {
+        let mut store = InMemoryFactStore::default();
+
+        let result = store.apply_invalidate_with_policy(
+            &FactWritePolicy,
+            "colmem",
+            "supports",
+            Some("mcp"),
+            "2026-04-11",
+        );
+
+        assert_eq!(result.decision, FactWriteDecision::Reject);
+        assert_eq!(result.invalidated, 0);
+        assert!(
+            store
+                .audit_log()
+                .iter()
+                .any(|event| event.action == "rejected")
+        );
+    }
+
+    #[test]
+    fn update_policy_supersedes_scheduled_relation() {
+        let mut store = InMemoryFactStore::default();
+        store.add_fact(Fact {
+            subject: "release".to_string(),
+            predicate: "date".to_string(),
+            object: "2026-05-01".to_string(),
+            valid_from: Some("2026-05-01".to_string()),
+            valid_to: None,
+            confidence: 88,
+            evidence_ids: vec!["scheduled".to_string()],
+        });
+
+        let result = store.apply_update_with_policy(
+            &FactWritePolicy,
+            Fact {
+                subject: "release".to_string(),
+                predicate: "date".to_string(),
+                object: "2026-04-28".to_string(),
+                valid_from: Some("2026-04-20".to_string()),
+                valid_to: None,
+                confidence: 92,
+                evidence_ids: vec!["replacement".to_string()],
+            },
+            "2026-04-20",
+        );
+
+        assert_eq!(result.decision, FactWriteDecision::Supersede);
+        assert_eq!(result.invalidated, 1);
+        let scheduled = store
+            .all()
+            .iter()
+            .find(|fact| fact.object == "2026-05-01")
+            .expect("scheduled fact");
+        assert_eq!(scheduled.valid_from.as_deref(), Some("2026-05-01"));
+        assert_eq!(scheduled.valid_to.as_deref(), Some("2026-04-20"));
+        assert_eq!(scheduled.status_on("2026-04-20"), "closed");
+    }
+
+    #[test]
+    fn invalidate_policy_allows_canceling_scheduled_relation() {
+        let mut store = InMemoryFactStore::default();
+        store.add_fact(Fact {
+            subject: "release".to_string(),
+            predicate: "date".to_string(),
+            object: "2026-05-01".to_string(),
+            valid_from: Some("2026-05-01".to_string()),
+            valid_to: None,
+            confidence: 88,
+            evidence_ids: vec!["scheduled".to_string()],
+        });
+
+        let result = store.apply_invalidate_with_policy(
+            &FactWritePolicy,
+            "release",
+            "date",
+            Some("2026-05-01"),
+            "2026-04-20",
+        );
+
+        assert_eq!(result.decision, FactWriteDecision::Invalidate);
+        assert_eq!(result.invalidated, 1);
+        let scheduled = store
+            .all()
+            .iter()
+            .find(|fact| fact.object == "2026-05-01")
+            .expect("scheduled fact");
+        assert_eq!(scheduled.valid_from.as_deref(), Some("2026-05-01"));
+        assert_eq!(scheduled.valid_to.as_deref(), Some("2026-04-20"));
+        assert_eq!(scheduled.status_on("2026-04-20"), "closed");
+    }
+
+    #[test]
+    fn add_policy_creates_bounded_historical_fact_instead_of_reinforcing_open_fact() {
+        let mut store = InMemoryFactStore::default();
+        store.add_fact(Fact {
+            subject: "svc".to_string(),
+            predicate: "status".to_string(),
+            object: "healthy".to_string(),
+            valid_from: Some("2026-04-01".to_string()),
+            valid_to: None,
+            confidence: 80,
+            evidence_ids: vec!["open".to_string()],
+        });
+
+        let result = store.apply_add_with_policy(
+            &FactWritePolicy,
+            Fact {
+                subject: "svc".to_string(),
+                predicate: "status".to_string(),
+                object: "healthy".to_string(),
+                valid_from: Some("2026-04-10".to_string()),
+                valid_to: Some("2026-04-15".to_string()),
+                confidence: 60,
+                evidence_ids: vec!["bounded".to_string()],
+            },
+        );
+
+        assert_eq!(result.decision, FactWriteDecision::Create);
+        assert_eq!(store.all().len(), 2);
+        assert!(
+            store
+                .all()
+                .iter()
+                .any(|fact| fact.valid_to.as_deref() == Some("2026-04-15"))
+        );
     }
 }

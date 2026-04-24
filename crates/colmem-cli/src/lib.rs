@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use colmem_core::agent::EvolutionSignal;
-use colmem_core::facts::{Fact, FactQueryScope, InMemoryFactStore};
+use colmem_core::facts::{Fact, FactQueryScope, FactWritePolicy, InMemoryFactStore};
 use colmem_core::harness::TaskIntent;
 use colmem_core::host::HostContext;
 use colmem_core::ingest::build_project_index;
@@ -2024,18 +2024,20 @@ fn cmd_facts(args: &[String], cwd: &Path) -> Result<String, String> {
             });
 
             let mut state = store.load_or_bootstrap()?;
-            state.facts.add_fact(Fact {
-                subject,
-                predicate,
-                object,
-                valid_from,
-                valid_to,
-                confidence,
-                evidence_ids,
-            });
-            state.facts.merge_duplicate_facts();
+            let result = state.facts.apply_add_with_policy(
+                &FactWritePolicy,
+                Fact {
+                    subject,
+                    predicate,
+                    object,
+                    valid_from,
+                    valid_to,
+                    confidence,
+                    evidence_ids,
+                },
+            );
             store.save(&state)?;
-            Ok(state.facts.all().last().expect("last fact").to_json())
+            Ok(result.to_json())
         }
         Some("update") => {
             let subject = args
@@ -2080,7 +2082,8 @@ fn cmd_facts(args: &[String], cwd: &Path) -> Result<String, String> {
                 });
 
             let mut state = store.load_or_bootstrap()?;
-            let invalidated = state.facts.replace_fact(
+            let result = state.facts.apply_update_with_policy(
+                &FactWritePolicy,
                 Fact {
                     subject,
                     predicate,
@@ -2093,11 +2096,7 @@ fn cmd_facts(args: &[String], cwd: &Path) -> Result<String, String> {
                 &effective_date,
             );
             store.save(&state)?;
-            Ok(format!(
-                "{{\"invalidated\": {}, \"fact\": {}}}",
-                invalidated,
-                state.facts.all().last().expect("last fact").to_json()
-            ))
+            Ok(result.to_json())
         }
         Some("invalidate") => {
             let subject = args.get(1).cloned().ok_or_else(|| {
@@ -2116,24 +2115,15 @@ fn cmd_facts(args: &[String], cwd: &Path) -> Result<String, String> {
                 .unwrap_or_else(colmem_core::facts::InMemoryFactStore::today_iso_utc);
 
             let mut state = store.load_or_bootstrap()?;
-            let invalidated =
-                state
-                    .facts
-                    .invalidate_matching(&subject, &predicate, object.as_deref(), &valid_to);
+            let result = state.facts.apply_invalidate_with_policy(
+                &FactWritePolicy,
+                &subject,
+                &predicate,
+                object.as_deref(),
+                &valid_to,
+            );
             store.save(&state)?;
-            Ok(json_object([
-                ("invalidated".to_string(), invalidated.to_string()),
-                ("subject".to_string(), quote(&subject)),
-                ("predicate".to_string(), quote(&predicate)),
-                (
-                    "object".to_string(),
-                    object
-                        .as_ref()
-                        .map(|value| quote(value))
-                        .unwrap_or_else(|| "null".to_string()),
-                ),
-                ("valid_to".to_string(), quote(&valid_to)),
-            ]))
+            Ok(result.to_json())
         }
         Some("audit") => {
             let state = store.load_or_bootstrap()?;
@@ -2826,6 +2816,7 @@ mod tests {
         )
         .expect("add fact");
         assert!(add.contains("\"supports\""));
+        assert!(add.contains("\"decision\": \"create\""));
 
         let query = run_in_dir(
             vec![
@@ -2839,6 +2830,51 @@ mod tests {
         )
         .expect("query facts");
         assert!(query.contains("\"object\": \"cli-tests\""));
+
+        let reinforce = run_in_dir(
+            vec![
+                "facts".to_string(),
+                "add".to_string(),
+                "colmem".to_string(),
+                "supports".to_string(),
+                "cli-tests".to_string(),
+                "95".to_string(),
+                "2026-04-11".to_string(),
+            ],
+            &root,
+        )
+        .expect("reinforce fact");
+        assert!(reinforce.contains("\"decision\": \"reinforce\""));
+
+        let bounded = run_in_dir(
+            vec![
+                "facts".to_string(),
+                "add".to_string(),
+                "colmem".to_string(),
+                "supports".to_string(),
+                "cli-tests".to_string(),
+                "70".to_string(),
+                "2026-04-12".to_string(),
+                "2026-04-15".to_string(),
+            ],
+            &root,
+        )
+        .expect("bounded fact");
+        assert!(bounded.contains("\"decision\": \"create\""));
+
+        let invalidate_missing = run_in_dir(
+            vec![
+                "facts".to_string(),
+                "invalidate".to_string(),
+                "colmem".to_string(),
+                "supports".to_string(),
+                "missing".to_string(),
+                "2026-04-12".to_string(),
+            ],
+            &root,
+        )
+        .expect("invalidate missing fact");
+        assert!(invalidate_missing.contains("\"decision\": \"reject\""));
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub use agent::{
 };
 pub use capability::{BindingMode, CapabilityDescriptor, CapabilityRegistry};
 pub use context::{ContextPack, ContextPackBuilder, ContextSection};
-pub use facts::{Fact, InMemoryFactStore};
+pub use facts::{Fact, FactWriteDecision, FactWritePolicy, FactWriteResult, InMemoryFactStore};
 pub use harness::{CapabilitySelection, HarnessRuntimeEngine, HarnessSnapshot, TaskIntent};
 pub use host::{HostContext, HostDescriptor};
 pub use ingest::{

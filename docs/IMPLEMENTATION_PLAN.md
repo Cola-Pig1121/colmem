@@ -1066,6 +1066,7 @@ Verified:
 - `colmem-core` now reserves an external rerank-model integration surface (`ExternalRerankModel`, `RerankModelRequest`, `RerankModelCandidate`, `RerankModelScore`) without adding a real model dependency; built-in retrieval must remain strong when no external reranker is configured
 - `HarnessSnapshot` and MCP query-plan output now expose a sibling `grounding_diagnostics` contract alongside `context_pack`, keeping `ContextPack` retrieval-only while surfacing machine-readable `answerable` / `under_supported` / `abstain` status, evidence strength, conflict count, temporal ambiguity, and reasons
 - harness regressions now prove strong-evidence queries remain answerable while weak-evidence and conflicting-evidence cases abstain instead of pretending answer readiness
+- Phase 2 started: `FactWritePolicy`, `FactWriteDecision`, and `FactWriteResult` now form an explicit write-policy layer above the backend for the existing CLI `facts add|update|invalidate` ingress, with `create/reinforce/supersede/invalidate/defer/reject` outcomes and audit-visible deferred/rejected events instead of direct store mutation from the CLI
 - LoCoMo `--dialog-window 2` is available for experimentation; official no-limit dialog run improved Recall@1 to 0.137, Recall@10 to 0.687, and Recall@50 to 0.876, but Recall@5 dipped to 0.547, so the default remains `--dialog-window 1`
 - direct CLI library tests for `init`, `host list`, `capability list`, `facts`, and `ingest -> query`
 - capability-enforcement regressions for `write` permissions and stateful host safety
